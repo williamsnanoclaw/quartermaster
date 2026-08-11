@@ -1,0 +1,391 @@
+import { chmodSync, copyFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { encode, lineReader, type Activity, type Msg, type Source, type State, type Status, type ToAgent, type ToHost } from '../protocol.ts';
+import { AgentUpdate, nameOf } from './agentupdate.ts';
+import { serve } from './bus.ts';
+import { isAuthFailure, login, loginStatus, logout, writeCodexConfig } from './codex.ts';
+import { journal } from './journal.ts';
+import { memory } from './memory.ts';
+import { schedules } from './schedules.ts';
+import { session } from './session.ts';
+import { toolHost } from './tools.ts';
+import { ensureWorkspace, paths } from './workspace.ts';
+
+/**
+ * The supervisor. It owns the human, and everything else asks it for access.
+ *
+ * Responsibilities, in order of how much they matter:
+ *   1. Die when the terminal dies. Nothing runs behind the human's back.
+ *   2. Serialise turns, so the agent is never racing itself.
+ *   3. Be the single place a question reaches a person and an answer comes back.
+ *   4. Survive its own bugs loudly rather than wedging quietly.
+ */
+
+const out = (message: ToHost) => process.stdout.write(encode(message));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One shared never-settling promise, so losing a race doesn't leak a new one each time. */
+const NEVER = new Promise<string>(() => {});
+
+let status: Status = { state: 'booting', detail: 'starting up', metrics: {}, since: Date.now(), next: null };
+
+function setStatus(patch: Partial<Status>) {
+  const changed = patch.state !== undefined && patch.state !== status.state;
+  status = {
+    ...status,
+    ...patch,
+    since: changed ? Date.now() : status.since,
+    next: schedules.upcoming(),
+    metrics: { ...(patch.metrics ?? status.metrics), ...(queue.length ? { queued: String(queue.length) } : {}) },
+  };
+  out({ k: 'status', status });
+}
+
+const say = (role: Msg['role'], text: string, source: Source) => {
+  const msg: Msg = { id: crypto.randomUUID(), role, text, source, at: Date.now() };
+  journal.record('message', msg);
+  out({ k: 'msg', msg });
+};
+
+/** Timers must never take the process down; a bad schedule is not a fatal error. */
+const every = (ms: number, work: () => void | Promise<void>) =>
+  setInterval(() => {
+    try {
+      const result = work();
+      if (result) result.catch((error: unknown) => journal.record('tick.failed', { error: String(error) }));
+    } catch (error) {
+      journal.record('tick.failed', { error: String(error) });
+    }
+  }, ms);
+
+// ---------------------------------------------------------------- the human
+
+type Waiter = { resolve: (answer: string) => void; reject: (error: Error) => void };
+const waiting = new Map<string, Waiter>();
+let agentUpdate = new AgentUpdate(undefined);
+
+/**
+ * Ask, and wait as long as it takes. The question goes to the terminal and to
+ * their phone at the same time; whichever answers first wins. There is no
+ * timeout on purpose — a silent default is how agents do damage.
+ */
+async function askHuman(question: string, options?: string[]): Promise<string> {
+  const id = crypto.randomUUID();
+  const previous: State = status.state === 'waiting' ? 'working' : status.state;
+  out({ k: 'ask', id, question, options });
+  setStatus({ state: 'waiting', detail: question });
+  journal.record('ask', { id, question, options });
+
+  const fromTerminal = new Promise<string>((resolve, reject) => waiting.set(id, { resolve, reject }));
+  const fromPhone = (async () => {
+    const messageId = await agentUpdate.ask(question, options);
+    if (!messageId) {
+      if (agentUpdate.enabled) {
+        out({ k: 'notice', level: 'warn', text: 'could not reach your phone — this question is terminal-only' });
+      }
+      return NEVER;
+    }
+    while (waiting.has(id)) {
+      const answer = await agentUpdate.answer(messageId);
+      if (answer !== null) return answer;
+      // answer() returns immediately while rate-limit backoff is armed, so the
+      // sleep is what stops this from starving the event loop.
+      await sleep(2_000);
+    }
+    return NEVER;
+  })();
+
+  try {
+    const answer = await Promise.race([fromTerminal, fromPhone]);
+    journal.record('answered', { id, answer });
+    say('you', answer, 'terminal');
+    return answer;
+  } finally {
+    waiting.delete(id);
+    out({ k: 'resolved', id });
+    setStatus({ state: previous, detail: 'thinking' });
+  }
+}
+
+/** An interrupted turn must not leave a question hanging in the UI forever. */
+function cancelAsks(why: string) {
+  for (const [id, waiter] of waiting) {
+    waiting.delete(id);
+    out({ k: 'resolved', id });
+    waiter.reject(new Error(why));
+  }
+}
+
+// ------------------------------------------------------------ the turn queue
+
+type Input = { text: string; source: Source; origin?: string; label?: string };
+
+const queue: Input[] = [];
+let running = false;
+let turnAbort: AbortController | null = null;
+
+/**
+ * Untrusted text must not be able to forge a higher-trust source tag. Room
+ * messages come from other agents; email and web pages come from strangers.
+ */
+const defang = (text: string) => text.replace(/\[(from their phone|group chat|scheduled job)/gi, '($1');
+
+const label = (input: Input) => {
+  const text = defang(input.text);
+  if (input.source === 'phone') return `[from their phone] ${text}`;
+  if (input.source === 'room') return `[group chat ${input.label ?? input.origin}] ${text}`;
+  if (input.source === 'schedule') return `[scheduled job: ${input.label}] ${text}`;
+  return text;
+};
+
+function enqueue(input: Input) {
+  queue.push(input);
+  if (input.source !== 'schedule') say('you', input.text, input.source);
+  void pump().catch((error: unknown) => {
+    journal.record('pump.failed', { error: String(error) });
+    out({ k: 'notice', level: 'error', text: `turn loop failed: ${String(error)}` });
+  });
+}
+
+async function pump() {
+  if (running) return;
+  running = true;
+  try {
+    await booting; // typing before sign-in finishes is normal; running a turn early is not
+    do {
+      while (queue.length) {
+        const batch = queue.splice(0);
+        const prompt = batch.map(label).join('\n\n');
+        turnAbort = new AbortController();
+        setStatus({ state: 'thinking', detail: 'working on it' });
+
+        let result = await session.run(prompt, handlers, turnAbort.signal);
+
+        // Tokens expire during long runs. Recovering beats waking the human.
+        if (result.error && result.errorKind === 'event' && isAuthFailure(result.error) && (await reauth())) {
+          result = await session.run(prompt, handlers, turnAbort.signal);
+        }
+
+        if (result.error) {
+          journal.record('turn.error', { error: result.error });
+          out({ k: 'notice', level: 'error', text: result.error });
+        }
+        // Reply where the message came from, so a phone thread stays a thread.
+        if (result.text) {
+          for (const roomId of new Set(batch.filter((i) => i.source === 'room').map((i) => i.origin!))) {
+            void agentUpdate.sendRoom(roomId, result.text);
+          }
+          if (batch.some((i) => i.source === 'phone')) void agentUpdate.send(result.text);
+        }
+      }
+
+      if (session.worthRotating()) {
+        setStatus({ state: 'working', detail: 'compacting the session' });
+        turnAbort = new AbortController();
+        await session.rotate(handlers, turnAbort.signal);
+      }
+      // Anything that arrived during rotation would otherwise sit here forever.
+    } while (queue.length);
+  } finally {
+    running = false;
+    turnAbort = null;
+    setStatus({ state: 'idle', detail: 'waiting' });
+  }
+}
+
+let agentName = process.env.TEMPER_NAME ?? 'temper';
+
+async function reauth(): Promise<boolean> {
+  out({ k: 'notice', level: 'warn', text: 'Codex credentials expired — signing in again' });
+  setStatus({ state: 'blocked', detail: 'signing in to Codex' });
+  logout();
+  const ok = await login((lines) => out({ k: 'login', lines }));
+  journal.record('reauth', { ok });
+  if (ok) out({ k: 'ready', name: agentName });
+  return ok;
+}
+
+const handlers = {
+  onActivity: (activity: Activity) => {
+    out({ k: 'activity', activity });
+    // Shell commands are this agent's main capability; a dashboard nobody was
+    // watching is not a record.
+    if (activity.status !== 'running') journal.record('did', activity);
+    if (status.state === 'thinking') setStatus({ state: 'working' });
+  },
+  onMessage: (text: string) => say('agent', text, 'terminal'),
+};
+
+// ------------------------------------------------------------ tools' access
+
+const secrets = new Map<string, string>();
+
+const host = toolHost({
+  ask: askHuman,
+  notify: async (text) => {
+    say('agent', text, 'system');
+    await agentUpdate.send(text);
+  },
+  status: (patch) => {
+    setStatus(patch);
+    writeFileSync(paths.state, JSON.stringify(status, null, 2));
+  },
+  rooms: {
+    list: () => agentUpdate.rooms(),
+    send: (roomId, text) => agentUpdate.sendRoom(roomId, text),
+  },
+  secrets,
+});
+
+serve({
+  'tools.list': async () => host.list(),
+  'tools.call': async ({ name, args }: { name: string; args: Record<string, unknown> }) => host.call(name, args),
+});
+
+// ----------------------------------------------------------------- lifecycle
+
+let lastPing = Date.now();
+let booting: Promise<void> | null = null;
+
+const read = lineReader<ToAgent>((message) => {
+  switch (message.k) {
+    case 'hello':
+      // Deliberately not awaited: pings and typing must keep flowing while
+      // sign-in waits on a human with a browser open.
+      booting ??= boot(message).catch((error: unknown) => {
+        out({ k: 'notice', level: 'error', text: `startup failed: ${String(error)}` });
+        journal.record('boot.failed', { error: String(error) });
+        process.exit(1);
+      });
+      break;
+    case 'say':
+      enqueue({ text: message.text, source: 'terminal' });
+      break;
+    case 'answer':
+      waiting.get(message.id)?.resolve(message.value);
+      break;
+    case 'interrupt':
+      turnAbort?.abort();
+      cancelAsks('the human interrupted');
+      break;
+    case 'ping':
+      lastPing = Date.now();
+      break;
+  }
+});
+
+process.stdin.on('data', read);
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('close', () => process.exit(0));
+
+// Belt and braces: if the terminal is killed hard enough that stdin never
+// closes, the missing heartbeat still takes us down.
+setInterval(() => {
+  if (Date.now() - lastPing > 45_000) process.exit(0);
+}, 5_000).unref();
+
+// An agent that dies with a stack trace nobody sees is worse than one that says
+// what happened. The host prints this and stops.
+for (const fatal of ['uncaughtException', 'unhandledRejection'] as const) {
+  process.on(fatal, (error: unknown) => {
+    try {
+      journal.record('crashed', { fatal, error: String(error) });
+    } catch {
+      // The journal may be exactly what's broken.
+    }
+    process.stderr.write(`${fatal}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+    process.exit(1);
+  });
+}
+
+async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
+  ensureWorkspace();
+  if (hello.tz) process.env.TEMPER_TZ = hello.tz;
+  for (const [name, value] of Object.entries(hello.secrets ?? {})) secrets.set(name, value);
+  // Never put this in the container's environment: the agent's own shell can
+  // read `env`, and this token speaks to the human as the agent.
+  agentUpdate = new AgentUpdate(hello.agentUpdateToken);
+
+  if (hello.authJson) {
+    const file = join(paths.codexHome, 'auth.json');
+    writeFileSync(file, hello.authJson);
+    chmodSync(file, 0o600);
+  }
+
+  for (const file of ['AGENTS.md', 'NORTH_STAR.md']) {
+    try {
+      copyFileSync(join('/app/agent', file), join(paths.root, file));
+    } catch {
+      // NORTH_STAR.md is optional until the human writes one.
+    }
+  }
+  writeCodexConfig();
+  memory.reindex();
+
+  if (!(await loginStatus())) {
+    setStatus({ state: 'blocked', detail: 'signing in to Codex' });
+    const ok = await login((lines) => out({ k: 'login', lines }));
+    if (!ok) {
+      out({ k: 'notice', level: 'error', text: 'Codex sign-in failed. Run `npm start -- login` and try again.' });
+      process.exit(1);
+    }
+  }
+
+  for (const problem of schedules.load()) out({ k: 'notice', level: 'warn', text: problem });
+  const missed = schedules.missed();
+  if (missed.length) {
+    session.note(`While the terminal was closed these scheduled jobs came due: ${missed.join('; ')}. Decide what is still worth doing.`);
+    out({ k: 'notice', level: 'info', text: `${missed.length} scheduled job(s) came due while you were away` });
+  }
+
+  // The agent cannot use a folder it doesn't know it has.
+  const shared = readdirSync(paths.mounts, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  if (shared.length) {
+    session.note(
+      `The human shared these folders with you, and they are real files on their machine: ` +
+        `${shared.map((entry) => `mounts/${entry.name}`).join(', ')}. Treat every write there as an effect: ask first.`,
+    );
+  }
+
+  const who = agentUpdate.enabled ? await agentUpdate.whoami() : null;
+  if (agentUpdate.enabled && !who) out({ k: 'notice', level: 'warn', text: 'Agent Update token rejected — phone and group chat are off' });
+
+  agentName = nameOf(who) ?? process.env.TEMPER_NAME ?? 'temper';
+  out({ k: 'ready', name: agentName });
+  setStatus({ state: 'idle', detail: 'waiting' });
+  journal.record('boot', { name: agentName, schedules: schedules.list().length });
+
+  // Poll their phone and group chats. `polling` stops a slow request from
+  // stacking up overlapping fetches that would each replay the same messages.
+  let polling = false;
+  if (agentUpdate.enabled && who) {
+    every(15_000, async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        for (const message of await agentUpdate.poll()) {
+          if (message.role === 'user' && message.body) {
+            enqueue({
+              text: message.body,
+              source: message.room ? 'room' : 'phone',
+              origin: message.room?.id,
+              label: message.room?.name ?? message.from ?? undefined,
+            });
+          }
+          agentUpdate.seen(message.id);
+        }
+      } finally {
+        polling = false;
+      }
+    });
+  }
+
+  every(20_000, () => {
+    for (const due of schedules.due()) {
+      journal.record('schedule.fired', { id: due.id });
+      enqueue({ text: due.prompt, source: 'schedule', label: due.name });
+    }
+  });
+
+  every(600_000, () => journal.compact()).unref();
+}

@@ -1,0 +1,13 @@
+﻿# Codex settings for this agent. Merged with Temper's required block on boot.
+#
+# Model choice is the biggest lever you have. Higher reasoning costs time and
+# plan usage; for an agent making judgement calls unattended, it is usually
+# worth it. Run `codex --help` or check your plan for available models.
+
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+
+# The agent can search the web. An agent that cannot look things up will
+# confidently invent them.
+[tools]
+web_search = true

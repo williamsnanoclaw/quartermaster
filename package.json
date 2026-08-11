@@ -1,0 +1,39 @@
+﻿{
+  "name": "temper",
+  "version": "0.1.0",
+  "description": "A boilerplate for terse, sandboxed agents that live in your terminal.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "temper": "dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "dist",
+    "src",
+    "agent",
+    "Dockerfile",
+    ".dockerignore",
+    "package-lock.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/src/cli.js",
+    "check": "tsc --noEmit",
+    "prepare": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "cron-parser": "^5.8.1",
+    "ink": "^7.1.1",
+    "react": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "typescript": "^5.9.3"
+  }
+}

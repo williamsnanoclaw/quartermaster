@@ -1,0 +1,3 @@
+# The runtime source is read inside a Linux container. Keep LF everywhere so a
+# clone on Windows doesn't ship CRLF into the image.
+* text=auto eol=lf
