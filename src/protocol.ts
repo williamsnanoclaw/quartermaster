@@ -67,7 +67,14 @@ export type ToAgent =
       secrets?: Record<string, string>;
       tz?: string;
     }
+  /**
+   * Settings changed on disk. Sent whenever .env or agent/ changes, so a model
+   * swap or a new credential lands on the next turn instead of on a restart.
+   */
+  | { k: 'config'; env: Record<string, string>; secrets: Record<string, string>; agentUpdateToken?: string }
   | { k: 'say'; text: string }
+  /** A standing order. Outlives every session arc. */
+  | { k: 'correct'; text: string }
   | { k: 'answer'; id: string; value: string }
   | { k: 'interrupt' }
   | { k: 'ping' };

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { encode, lineReader, type Activity, type Msg, type Source, type State, type Status, type ToAgent, type ToHost } from '../protocol.ts';
 import { AgentUpdate, nameOf } from './agentupdate.ts';
 import { serve } from './bus.ts';
+import { corrections } from './corrections.ts';
 import { isAuthFailure, login, loginStatus, logout, writeCodexConfig } from './codex.ts';
 import { journal } from './journal.ts';
 import { memory } from './memory.ts';
@@ -65,11 +66,24 @@ const waiting = new Map<string, Waiter>();
 let agentUpdate = new AgentUpdate(undefined);
 
 /**
- * Ask, and wait as long as it takes. The question goes to the terminal and to
- * their phone at the same time; whichever answers first wins. There is no
- * timeout on purpose — a silent default is how agents do damage.
+ * Nudge once, then stop waiting. Not configurable, because the right answer
+ * doesn't vary by deployment: an unanswered question should cost the human one
+ * extra buzz and cost the agent one hour, and no agent should be able to argue
+ * its way to a shorter fuse.
  */
-async function askHuman(question: string, options?: string[]): Promise<string> {
+const NUDGE_AFTER = 20 * 60_000;
+const GIVE_UP_AFTER = 60 * 60_000;
+
+/**
+ * Ask, and wait. The question goes to the terminal and their phone at once;
+ * whichever answers first wins.
+ *
+ * Returns null when nobody answered in an hour. That is not a default answer —
+ * every caller treats silence as "no" for anything with an effect, and only
+ * plain questions are allowed to continue without one. A blocked ask used to
+ * hold the entire queue: one 3am question and the agent was deaf until morning.
+ */
+async function askHuman(question: string, options?: string[]): Promise<string | null> {
   const id = crypto.randomUUID();
   const previous: State = status.state === 'waiting' ? 'working' : status.state;
   out({ k: 'ask', id, question, options });
@@ -95,15 +109,42 @@ async function askHuman(question: string, options?: string[]): Promise<string> {
     return NEVER;
   })();
 
+  let nudge: NodeJS.Timeout | undefined;
+  let giveUp: NodeJS.Timeout | undefined;
+  const expiry = new Promise<null>((resolve) => {
+    nudge = setTimeout(() => {
+      if (waiting.has(id)) void agentUpdate.send(`still waiting on this: ${question}`);
+    }, NUDGE_AFTER);
+    giveUp = setTimeout(() => resolve(null), GIVE_UP_AFTER);
+  });
+
   try {
-    const answer = await Promise.race([fromTerminal, fromPhone]);
-    journal.record('answered', { id, answer });
-    say('you', answer, 'terminal');
+    const answer = await Promise.race([fromTerminal, fromPhone, expiry]);
+    if (answer === null) {
+      journal.record('unanswered', { id, question });
+      out({ k: 'notice', level: 'warn', text: `no answer in an hour — the agent will work around it: ${question}` });
+    } else {
+      journal.record('answered', { id, answer });
+      say('you', answer, 'terminal');
+    }
     return answer;
   } finally {
+    clearTimeout(nudge);
+    clearTimeout(giveUp);
     waiting.delete(id);
     out({ k: 'resolved', id });
     setStatus({ state: previous, detail: 'thinking' });
+  }
+}
+
+/** A standing order. Recorded now, in force from the agent's next turn. */
+function applyCorrection(text: string) {
+  try {
+    const added = corrections.add(text);
+    say('system', `standing order recorded: ${added.text}`, 'system');
+    session.note(`New standing order from the human, in force from now on: ${added.text}`);
+  } catch (error) {
+    out({ k: 'notice', level: 'error', text: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -246,6 +287,24 @@ serve({
 
 let lastPing = Date.now();
 let booting: Promise<void> | null = null;
+let agentUpdateToken: string | undefined;
+
+/**
+ * Settings changed on disk. Everything the runtime reads is read at call time,
+ * so a new model, a rotated credential or a different arc ceiling takes effect
+ * on the next turn without restarting — and without losing the session.
+ */
+function applyConfig(update: Extract<ToAgent, { k: 'config' }>) {
+  Object.assign(process.env, update.env);
+  secrets.clear();
+  for (const [name, value] of Object.entries(update.secrets)) secrets.set(name, value);
+  if (update.agentUpdateToken !== agentUpdateToken) {
+    agentUpdateToken = update.agentUpdateToken;
+    agentUpdate = new AgentUpdate(agentUpdateToken);
+  }
+  journal.record('config.reloaded', { keys: Object.keys(update.env).sort() });
+  out({ k: 'notice', level: 'info', text: 'settings reloaded' });
+}
 
 const read = lineReader<ToAgent>((message) => {
   switch (message.k) {
@@ -258,8 +317,14 @@ const read = lineReader<ToAgent>((message) => {
         process.exit(1);
       });
       break;
+    case 'config':
+      applyConfig(message);
+      break;
     case 'say':
       enqueue({ text: message.text, source: 'terminal' });
+      break;
+    case 'correct':
+      applyCorrection(message.text);
       break;
     case 'answer':
       waiting.get(message.id)?.resolve(message.value);
@@ -304,7 +369,8 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
   for (const [name, value] of Object.entries(hello.secrets ?? {})) secrets.set(name, value);
   // Never put this in the container's environment: the agent's own shell can
   // read `env`, and this token speaks to the human as the agent.
-  agentUpdate = new AgentUpdate(hello.agentUpdateToken);
+  agentUpdateToken = hello.agentUpdateToken;
+  agentUpdate = new AgentUpdate(agentUpdateToken);
 
   if (hello.authJson) {
     const file = join(paths.codexHome, 'auth.json');
@@ -321,6 +387,8 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
   }
   writeCodexConfig();
   memory.reindex();
+  // Restores the file from the journal, undoing anything the agent did to it.
+  corrections.publish();
 
   if (!(await loginStatus())) {
     setStatus({ state: 'blocked', detail: 'signing in to Codex' });
@@ -365,12 +433,17 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
       try {
         for (const message of await agentUpdate.poll()) {
           if (message.role === 'user' && message.body) {
-            enqueue({
-              text: message.body,
-              source: message.room ? 'room' : 'phone',
-              origin: message.room?.id,
-              label: message.room?.name ?? message.from ?? undefined,
-            });
+            // A standing order is a standing order wherever you type it.
+            const correction = /^\s*[/!]correct\s+([\s\S]+)/i.exec(message.body);
+            if (correction) applyCorrection(correction[1]!);
+            else {
+              enqueue({
+                text: message.body,
+                source: message.room ? 'room' : 'phone',
+                origin: message.room?.id,
+                label: message.room?.name ?? message.from ?? undefined,
+              });
+            }
           }
           agentUpdate.seen(message.id);
         }

@@ -94,7 +94,11 @@ export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name:
       setDraft('');
       setRecall(-1);
       setHistory((h) => [text, ...h].slice(0, 100));
-      if (ask) bridge.send({ k: 'answer', id: ask.id, value: resolveAnswer(text, ask.options) });
+      // `/correct` is the one command worth having: a standing order outlives
+      // every session arc, so it must not be phrased as a passing remark.
+      const correction = /^\/correct\s+([\s\S]+)/i.exec(text);
+      if (correction) bridge.send({ k: 'correct', text: correction[1]! });
+      else if (ask) bridge.send({ k: 'answer', id: ask.id, value: resolveAnswer(text, ask.options) });
       else bridge.send({ k: 'say', text });
       return;
     }
@@ -136,7 +140,9 @@ export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name:
         <Text>{draft}</Text>
         <Text inverse>{' '}</Text>
       </Box>
-      <Text dimColor>{`  enter send · esc interrupt · ctrl-c quit${ask ? ' · answering the question above' : ''}`}</Text>
+      <Text dimColor>
+        {`  enter send · /correct <rule> standing order · esc interrupt · ctrl-c quit${ask ? ' · answering the question above' : ''}`}
+      </Text>
     </Box>
   );
 }

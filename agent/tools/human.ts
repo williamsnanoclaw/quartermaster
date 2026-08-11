@@ -8,7 +8,8 @@ export const ask = defineTool<{ question: string; options?: string[] }>({
   description:
     'Ask the human a question and wait for the answer. Use this before anything that affects them, ' +
     'and whenever a guess would be expensive to get wrong. Reaches their terminal and their phone. ' +
-    'One question, one sentence.',
+    'One question, one sentence. If they are away for an hour it comes back saying nobody answered — ' +
+    'that is not a yes; work around it and leave the question open.',
   input: input({
     question: { type: 'string', description: 'The question. Short. No preamble.' },
     options: {

@@ -79,9 +79,18 @@ terminal — a line on your lock screen, a question with tappable answers, group
 chats where several of your agents and you talk in one room. Terminal and phone
 are the same conversation; answer wherever you are.
 
+**Standing orders.** `/correct always ship before polishing` records a rule that
+outlives every session. Corrections are re-read at the start of each one, so
+compaction can't lose them, and the agent can't edit the file — it's rewritten
+from the journal, because a rule the agent can quietly repeal isn't a rule.
+
 **A journal.** Every message, shell command, tool call, approval and schedule
 run, appended to SQLite. The agent reads its own with the `history` tool, so
 "what did you do last Tuesday?" is a question it answers rather than guesses at.
+
+**Live settings.** Edit `.env` or anything in `agent/` and the change reaches
+the running agent on its next turn. Swapping the model or rotating a credential
+doesn't cost you the session.
 
 ## Where the lines are
 
@@ -126,6 +135,11 @@ scrollback.
 Turns run one at a time, queued, so it never races itself. Writes are atomic,
 the journal is append-only and self-pruning, and a crash says what happened
 instead of wedging.
+
+Questions don't stall it either. An unanswered question buzzes your phone once
+at twenty minutes and gives up at an hour, and the agent is told to work around
+it rather than wait. Silence is never taken as approval — anything with an
+effect simply doesn't run.
 
 ## Commands
 
