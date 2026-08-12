@@ -34,7 +34,10 @@ export const session = {
   async run(prompt: string, handlers: TurnHandlers, signal: AbortSignal): Promise<TurnResult> {
     // Read, don't drain: a turn that fails must not swallow the one thing it
     // was supposed to tell the agent.
-    const carried = pending;
+    // A copy, not an alias. Aliasing meant anything queued *during* the turn
+    // was also in `carried`, so the filter below dropped it as delivered — a
+    // standing order typed while the agent is working vanished silently.
+    const carried = [...pending];
     const preface = [this.threadId ? '' : seed(), carried.join('\n')].filter(Boolean).join('\n\n');
 
     const result = await runTurn(preface ? `${preface}\n\n---\n\n${prompt}` : prompt, this.threadId, handlers, signal);
