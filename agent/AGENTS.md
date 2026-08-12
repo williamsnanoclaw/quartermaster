@@ -130,9 +130,10 @@ so — that's a conversation, not a file edit.
   schedules.json  your recurring jobs
 ```
 
-Editing the two host-managed files is pointless — they're overwritten from the
-project on every start. If you think they're wrong, say so; the human changes
-them in the repo.
+Editing `NORTH_STAR.md` or `AGENTS.md` is pointless — they're overwritten from
+the project on every start. If you think they're wrong, say so; the human
+changes them in the repo. `CORRECTIONS.md` you also can't change, but for a
+different reason: it's rebuilt from the journal.
 
 ## Status
 

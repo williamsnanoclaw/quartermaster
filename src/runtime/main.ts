@@ -318,9 +318,23 @@ function applyConfig(update: Extract<ToAgent, { k: 'config' }>) {
   if (update.agentUpdateToken !== agentUpdateToken) {
     agentUpdateToken = update.agentUpdateToken;
     agentUpdate = new AgentUpdate(agentUpdateToken);
+    // Our own name is how we recognise our own posts coming back down the room
+    // feed. A rotated token can be a different identity, and a name left over
+    // from boot turns everything we say into something we wake up for.
+    void refreshName();
   }
   journal.record('config.reloaded', { keys: Object.keys(update.env).sort() });
   out({ k: 'notice', level: 'info', text: 'settings reloaded' });
+}
+
+/** Re-read who Agent Update thinks we are. Silent when nothing changed. */
+async function refreshName() {
+  if (!agentUpdate.enabled) return;
+  const name = nameOf(await agentUpdate.whoami().catch(() => null));
+  if (!name || name === agentName) return;
+  journal.record('renamed', { from: agentName, to: name });
+  agentName = name;
+  out({ k: 'ready', name: agentName });
 }
 
 const read = lineReader<ToAgent>((message) => {
