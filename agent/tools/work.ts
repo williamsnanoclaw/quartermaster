@@ -1,5 +1,5 @@
 import { defineTool, input, type Ctx } from './_kit.ts';
-import { minutesSince, resolveRoom } from './fleet.ts';
+import { minutesSince, noted, resolveRoom } from './fleet.ts';
 
 /**
  * Work handed to another agent, and kept track of until it is actually done.
@@ -46,7 +46,7 @@ type Assignment = {
 };
 
 async function load(ctx: Ctx) {
-  const events = ((await ctx.history(LOOKBACK, 'assignment')) ?? []) as Entry[];
+  const events = ((await ctx.history(LOOKBACK, noted('assignment'))) ?? []) as Entry[];
   const byId = new Map<string, Assignment>();
   /** Events for an assignment whose `opened` has scrolled out of the window. */
   let orphaned = 0;
@@ -100,22 +100,29 @@ async function load(ctx: Ctx) {
 }
 
 /** Ages attached to everything, because an age is the difference between an observation and a guess. */
-const view = (a: Assignment) => ({
-  id: a.id,
-  agent: a.agent,
-  room: a.room,
-  request: a.request,
-  openedMinutesAgo: minutesSince(a.openedAt),
-  silentForMinutes: minutesSince(a.heardAt ?? a.lastSentAt),
-  heardAnything: a.heard.length > 0,
-  heard: a.heard,
-  chases: a.chases,
-  expectMinutes: a.expectMinutes,
-  // Only ever true when you said what to expect. Without that this is silence
-  // of an unknown duration, which is not the same as being late.
-  overdue: !a.closed && a.expectMinutes !== null && minutesSince(a.lastSentAt) > a.expectMinutes,
-  closed: a.closed,
-});
+const view = (a: Assignment) => {
+  // Their silence, not ours. Measuring from our own last message would mean a
+  // chase resets the clock — so the more times you nudged a dead agent, the
+  // healthier it would look, and it would never once read as overdue.
+  const silentForMinutes = minutesSince(a.heardAt ?? a.openedAt);
+  return {
+    id: a.id,
+    agent: a.agent,
+    room: a.room,
+    request: a.request,
+    openedMinutesAgo: minutesSince(a.openedAt),
+    silentForMinutes,
+    lastChasedMinutesAgo: a.chases ? minutesSince(a.lastSentAt) : null,
+    heardAnything: a.heard.length > 0,
+    heard: a.heard,
+    chases: a.chases,
+    expectMinutes: a.expectMinutes,
+    // Only ever true when you said what to expect. Without that this is silence
+    // of an unknown duration, which is not the same as being late.
+    overdue: !a.closed && a.expectMinutes !== null && silentForMinutes > a.expectMinutes,
+    closed: a.closed,
+  };
+};
 
 const open = (list: Assignment[]) => list.filter((a) => !a.closed);
 
@@ -159,8 +166,20 @@ export const delegate = defineTool<{ agent: string; request: string; expect_with
       };
     }
 
-    const id = crypto.randomUUID().slice(0, 8);
-    await ctx.rooms.send(found.room.id, args.request);
+    // Agent Update returns nothing at all when a send fails — dead room, refused
+    // token, rate limit. Opening an assignment for a message that was never
+    // delivered would manufacture the one fact this agent must never invent.
+    if (!(await ctx.rooms.send(found.room.id, args.request))) {
+      await ctx.note('assignment.undelivered', { agent: args.agent, room: found.room.name });
+      return {
+        ok: false,
+        reason:
+          `The post to ${found.room.name} did not go through, so nothing was opened and ${args.agent} has ` +
+          'not been asked. Agent Update refused it, is rate-limited, or that room is gone. Check `fleet` and retry.',
+      };
+    }
+
+    const id = crypto.randomUUID().slice(0, 12);
     await ctx.note('assignment', {
       event: 'opened',
       id,
@@ -195,10 +214,21 @@ export const followUp = defineTool<{ id: string; message: string }>({
       return { ok: false, reason: found.reason, rooms: found.rooms.map((room) => ({ id: room.id, name: room.name })) };
     }
 
-    await ctx.rooms.send(found.room.id, args.message);
+    if (!(await ctx.rooms.send(found.room.id, args.message))) {
+      return {
+        ok: false,
+        reason:
+          `The post to ${found.room.name} did not go through, so ${assignment.agent} has not seen this. ` +
+          'The assignment is untouched. Check `fleet` and retry.',
+      };
+    }
+
     await ctx.note('assignment', {
       event: 'followed_up',
       id: args.id,
+      // `fleet` reads the newest event carrying an agent to answer "when did I
+      // last send to them" — without this a chase never advances it.
+      agent: assignment.agent,
       room: found.room.name,
       roomId: found.room.id,
       message: args.message,
@@ -278,7 +308,12 @@ export const assignments = defineTool<{ include_closed?: boolean }>({
       open: live,
       overdue: live.filter((a) => a.overdue).map((a) => a.id),
       neverAnsweredCount: live.filter((a) => !a.heardAnything).length,
-      closed: args.include_closed ? list.filter((a) => a.closed).map(view) : undefined,
+      closed: args.include_closed
+        ? list
+            .filter((a) => a.closed)
+            .sort((a, b) => (a.closed!.at < b.closed!.at ? 1 : -1))
+            .map(view)
+        : undefined,
       // Saying this out loud matters more than the list itself: a short list
       // read as "nothing outstanding" is how a dropped request stays dropped.
       incomplete: saturated || orphaned > 0 || undefined,
