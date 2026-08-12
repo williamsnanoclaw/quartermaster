@@ -191,6 +191,10 @@ export function runTurn(
   ];
   const args = threadId ? ['exec', 'resume', threadId, ...flags, '-'] : ['exec', ...flags, '-'];
 
+  // Re-rendered every turn rather than at boot, so editing agent/codex.toml on
+  // the host — it is a live mount — takes effect on the next thing you say.
+  writeCodexConfig();
+
   const child = codex(args);
   child.stdin.end(prompt);
   turn += 1;

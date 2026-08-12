@@ -1,4 +1,5 @@
 import { runTurn, type TurnHandlers, type TurnResult } from './codex.ts';
+import { corrections } from './corrections.ts';
 import { journal } from './journal.ts';
 import { memory } from './memory.ts';
 
@@ -12,8 +13,9 @@ import { memory } from './memory.ts';
  * objective. Nothing important is lost, because anything important was already
  * written down. That is why memory is a folder and not a scrollback.
  */
-const TOKEN_CEILING = Number(process.env.TEMPER_ARC_TOKENS ?? 220_000);
-const TURN_CEILING = Number(process.env.TEMPER_ARC_TURNS ?? 60);
+// Read at call time, not at import: settings can change under a running agent.
+const tokenCeiling = () => Number(process.env.TEMPER_ARC_TOKENS ?? 220_000);
+const turnCeiling = () => Number(process.env.TEMPER_ARC_TURNS ?? 60);
 const INDEX_LIMIT = 200;
 
 /** Things the agent should be told at the start of its next turn, whenever that is. */
@@ -54,7 +56,7 @@ export const session = {
   },
 
   worthRotating(): boolean {
-    return this.tokens > TOKEN_CEILING || this.turns > TURN_CEILING;
+    return this.tokens > tokenCeiling() || this.turns > turnCeiling();
   },
 
   /**
@@ -97,6 +99,8 @@ function seed(): string {
   return [
     `Session started ${new Date().toISOString()} (${process.env.TEMPER_TZ ?? 'UTC'}).`,
     'Working directory is /workspace. AGENTS.md is how you operate; NORTH_STAR.md is why you exist.',
+    // Re-asserted on every arc, so compaction can never quietly repeal a rule.
+    corrections.render(),
     notes.length
       ? `Memory (${notes.length} notes, \`cat memory/<id>.md\` to read one):\n` +
         shown.map((n) => `- ${n.id}: ${n.title}`).join('\n') +

@@ -19,7 +19,8 @@ import { schedules } from './schedules.ts';
  * fetched from inside a tool invocation the human approved.
  */
 export type Deps = {
-  ask: (question: string, options?: string[]) => Promise<string>;
+  /** Resolves to null when the human never answered. Never a default answer. */
+  ask: (question: string, options?: string[]) => Promise<string | null>;
   notify: (text: string) => Promise<void>;
   status: (patch: Partial<Pick<Status, 'detail' | 'metrics'>> & { state?: State }) => void;
   rooms: { list: () => Promise<unknown>; send: (roomId: string, text: string) => Promise<unknown> };
@@ -44,7 +45,12 @@ export function toolHost(deps: Deps) {
   };
 
   const contextFor = (tool: Tool): Ctx => ({
-    ask: deps.ask,
+    // A question is the one place silence can be reported rather than refused —
+    // the agent is told to route around it instead of stalling until morning.
+    ask: async (question, options) =>
+      (await deps.ask(question, options)) ??
+      'No answer — they have been away for an hour. Do not wait on this. Do whatever the answer ' +
+        'does not change, and leave the question for them.',
     notify: deps.notify,
     status: async (patch) => deps.status(patch),
     remember: async (note) => memory.write(note),
@@ -77,6 +83,7 @@ export function toolHost(deps: Deps) {
       const key = `${tool.name}:${name}`;
       if (!allowed.has(key)) {
         const answer = await deps.ask(`Let ${tool.name} use the ${name} credential this session?`, ['Yes', 'No']);
+        if (answer === null) throw new Error(`nobody answered, so ${name} stays sealed. Try again when they are back.`);
         if (!/^y/i.test(answer)) throw new Error(`the human declined ${name} to ${tool.name}`);
         allowed.add(key);
       }
@@ -97,6 +104,15 @@ export function toolHost(deps: Deps) {
         const line = preview(tool, args);
         const options = tool.repeatable ? ['Allow once', 'Allow all session', 'No'] : ['Allow once', 'No'];
         const answer = await deps.ask(line, options);
+        // Silence is a refusal here, always. An agent that acts on an unanswered
+        // approval has turned "ask first" into "ask, then do it anyway".
+        if (answer === null) {
+          journal.record('unapproved', { tool: name, preview: line });
+          return {
+            text: 'Nobody answered, so this did not run. Do not retry it until they are back and say yes.',
+            failed: true,
+          };
+        }
         if (!/allow/i.test(answer)) {
           journal.record('declined', { tool: name, preview: line, answer });
           return { text: 'the human declined. Do not retry without a new instruction from them.', failed: true };

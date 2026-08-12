@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
+import { watch } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { render } from 'ink';
 import { manifest } from '../agent/manifest.ts';
@@ -118,8 +119,41 @@ async function up(reconfigure: boolean) {
 
   const heartbeat = setInterval(() => bridge.send({ k: 'ping' }), 10_000);
 
-  child.on('close', (code) => {
+  // Edit .env or anything in agent/ and the change reaches a running agent.
+  // Debounced because editors write a file two or three times per save.
+  let pending: NodeJS.Timeout | undefined;
+  const reload = () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => {
+      const latest = { ...withDefaults, ...readEnv(root) };
+      const parts = split(manifest, latest);
+      bridge.send({
+        k: 'config',
+        env: parts.agent,
+        secrets: parts.gated,
+        agentUpdateToken: parts.runtime.AGENT_UPDATE_TOKEN,
+      });
+    }, 300);
+  };
+  // A missing .env or a filesystem that can't watch recursively is not worth
+  // refusing to start over; you just lose live reload.
+  const observe = (path: string, recursive = false) => {
+    try {
+      return watch(path, { recursive }, reload);
+    } catch {
+      return null;
+    }
+  };
+  const watchers = [observe(join(root, '.env')), observe(join(root, 'agent'), true)].filter((w) => w !== null);
+
+  const shutdown = () => {
     clearInterval(heartbeat);
+    clearTimeout(pending);
+    for (const watcher of watchers) watcher.close();
+  };
+
+  child.on('close', (code) => {
+    shutdown();
     app.unmount();
     restore();
     if (code) console.error(`\nthe agent stopped (exit ${code})\n${stderr.trim()}`);
@@ -127,6 +161,6 @@ async function up(reconfigure: boolean) {
   });
 
   await app.waitUntilExit();
-  clearInterval(heartbeat);
+  shutdown();
   child.stdin?.end();
 }

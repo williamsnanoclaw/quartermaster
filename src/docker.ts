@@ -79,6 +79,8 @@ export function start({ root, name, tag, env, mounts }: Launch): ChildProcess {
     // A runaway agent should exhaust its own container, not the machine.
     '--memory', process.env.TEMPER_MEMORY ?? '4g',
     '--pids-limit', '512',
+    // Nothing inside can gain privileges it wasn't started with, even via setuid.
+    '--security-opt', 'no-new-privileges',
     '-v', `temper-${name}:/workspace`,
     '-v', `${join(root, 'agent')}:/app/agent:ro`,
   ];
