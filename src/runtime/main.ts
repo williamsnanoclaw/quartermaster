@@ -1,6 +1,16 @@
 import { chmodSync, copyFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { encode, lineReader, type Activity, type Msg, type Source, type State, type Status, type ToAgent, type ToHost } from '../protocol.ts';
+import {
+  encode,
+  lineReader,
+  type Activity,
+  type Msg,
+  type Source,
+  type State,
+  type Status,
+  type ToAgent,
+  type ToHost,
+} from '../protocol.ts';
 import { AgentUpdate, nameOf } from './agentupdate.ts';
 import { serve } from './bus.ts';
 import { isAuthFailure, login, loginStatus, logout, writeCodexConfig } from './codex.ts';
@@ -118,7 +128,8 @@ function cancelAsks(why: string) {
 
 // ------------------------------------------------------------ the turn queue
 
-type Input = { text: string; source: Source; origin?: string; label?: string };
+/** `from` is set only when another agent posted in a room. See `enqueue`. */
+type Input = { text: string; source: Source; origin?: string; label?: string; from?: string };
 
 const queue: Input[] = [];
 let running = false;
@@ -133,6 +144,8 @@ const defang = (text: string) => text.replace(/\[(from their phone|group chat|sc
 const label = (input: Input) => {
   const text = defang(input.text);
   if (input.source === 'phone') return `[from their phone] ${text}`;
+  if (input.source === 'room' && input.from)
+    return `[group chat ${input.label ?? input.origin}] ${input.from}: ${text}`;
   if (input.source === 'room') return `[group chat ${input.label ?? input.origin}] ${text}`;
   if (input.source === 'schedule') return `[scheduled job: ${input.label}] ${text}`;
   return text;
@@ -140,7 +153,8 @@ const label = (input: Input) => {
 
 function enqueue(input: Input) {
   queue.push(input);
-  if (input.source !== 'schedule') say('you', input.text, input.source);
+  if (input.from) say('system', `${input.from}: ${input.text}`, input.source);
+  else if (input.source !== 'schedule') say('you', input.text, input.source);
   void pump().catch((error: unknown) => {
     journal.record('pump.failed', { error: String(error) });
     out({ k: 'notice', level: 'error', text: `turn loop failed: ${String(error)}` });
@@ -171,8 +185,11 @@ async function pump() {
           out({ k: 'notice', level: 'error', text: result.error });
         }
         // Reply where the message came from, so a phone thread stays a thread.
+        // Never auto-reply to a peer agent: two agents each answering the
+        // other's answer does not stop. Posting back is a deliberate act, so
+        // it goes through `room_send`.
         if (result.text) {
-          for (const roomId of new Set(batch.filter((i) => i.source === 'room').map((i) => i.origin!))) {
+          for (const roomId of new Set(batch.filter((i) => i.source === 'room' && !i.from).map((i) => i.origin!))) {
             void agentUpdate.sendRoom(roomId, result.text);
           }
           if (batch.some((i) => i.source === 'phone')) void agentUpdate.send(result.text);
@@ -334,7 +351,9 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
   for (const problem of schedules.load()) out({ k: 'notice', level: 'warn', text: problem });
   const missed = schedules.missed();
   if (missed.length) {
-    session.note(`While the terminal was closed these scheduled jobs came due: ${missed.join('; ')}. Decide what is still worth doing.`);
+    session.note(
+      `While the terminal was closed these scheduled jobs came due: ${missed.join('; ')}. Decide what is still worth doing.`,
+    );
     out({ k: 'notice', level: 'info', text: `${missed.length} scheduled job(s) came due while you were away` });
   }
 
@@ -348,7 +367,8 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
   }
 
   const who = agentUpdate.enabled ? await agentUpdate.whoami() : null;
-  if (agentUpdate.enabled && !who) out({ k: 'notice', level: 'warn', text: 'Agent Update token rejected — phone and group chat are off' });
+  if (agentUpdate.enabled && !who)
+    out({ k: 'notice', level: 'warn', text: 'Agent Update token rejected — phone and group chat are off' });
 
   agentName = nameOf(who) ?? process.env.TEMPER_NAME ?? 'temper';
   out({ k: 'ready', name: agentName });
@@ -364,12 +384,22 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
       polling = true;
       try {
         for (const message of await agentUpdate.poll()) {
-          if (message.role === 'user' && message.body) {
+          // A peer's post has to wake us. An agent that answers and is never
+          // heard is indistinguishable from one that has stopped, and knowing
+          // that difference is this agent's whole job. Rooms only — a peer
+          // cannot DM us, and our own posts come back down the same feed.
+          const peer = message.role !== 'user' ? (message.from ?? 'another agent') : undefined;
+          const mine = peer !== undefined && message.from === agentName;
+          // Recorded separately from the message itself so "when did this
+          // agent last actually say something" is one query, not a scan.
+          if (peer && !mine && message.room) journal.record('room.heard', { from: peer, room: message.room.name });
+          if (message.body && !mine && (!peer || message.room)) {
             enqueue({
               text: message.body,
               source: message.room ? 'room' : 'phone',
               origin: message.room?.id,
               label: message.room?.name ?? message.from ?? undefined,
+              from: peer,
             });
           }
           agentUpdate.seen(message.id);

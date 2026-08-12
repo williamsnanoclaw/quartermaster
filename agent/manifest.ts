@@ -12,21 +12,21 @@ import type { Manifest } from '../src/config.ts';
  * NORTH_STAR.md too. Nothing here reaches the model.
  */
 export const manifest: Manifest = {
-  name: 'temper',
-  tagline: 'a terse agent that lives in your terminal',
+  name: 'quartermaster',
+  tagline: 'manages and observes your company of agents',
 
   settings: [
     {
       key: 'TEMPER_NAME',
       label: 'Agent name',
       why: 'Shown on the dashboard and in group chats. Give it a name you would use out loud.',
-      default: 'temper',
+      default: 'quartermaster',
       optional: true,
     },
     {
       key: 'AGENT_UPDATE_TOKEN',
       label: 'Agent Update token',
-      why: 'How the agent reaches you when you are not at the terminal — a line on your lock screen, a question with tappable answers, group chats with your other agents. Skip it and the agent still works, but only while you are watching.',
+      why: 'Not optional for this agent. The group chats are the only way it reaches your other agents — without a token it cannot ask any of them anything, and managing a fleet it cannot talk to is not a job. It is also how it reaches you when you are away from the terminal.',
       how: [
         'Install Agent Update on iPhone and sign in',
         'Tap + → New agent, name it whatever you named this one',
@@ -34,7 +34,6 @@ export const manifest: Manifest = {
       ],
       url: 'https://tryagentupdate.com/docs/quickstart',
       secret: true,
-      optional: true,
       // Only the supervisor uses this. Keeping it out of the container's
       // environment means the agent's own shell cannot read the token that
       // speaks to you as the agent.
@@ -52,7 +51,8 @@ export const manifest: Manifest = {
     {
       key: 'TEMPER_TZ',
       label: 'Timezone',
-      why: "Schedules are written in your local time, not the container's.",
+      why: "Schedules are written in your local time, not the container's. It also decides when the quiet hours in NORTH_STAR.md start.",
+      default: 'America/New_York',
       optional: true,
     },
     {
@@ -69,21 +69,15 @@ export const manifest: Manifest = {
       optional: true,
     },
 
-    // ---- Add what your agent needs below. Three shapes to copy: ----
-
     {
-      key: 'WEBHOOK_TOKEN',
-      label: 'Webhook token',
-      why: 'Used by the example tool. Gated: the container never holds it — the agent has to ask you before it is released, and only for the tool that asked.',
-      secret: true,
-      optional: true,
-      scope: 'gated',
-    },
-    {
-      key: 'NOTES_DIR',
-      label: 'Notes folder',
-      why: 'A folder on your machine the agent may read, e.g. an Obsidian vault. It is mounted read-only. To let the agent write to it, add `writable: true` here — and read the mounts warning in the README first, because writes through a mount are not gated by anything.',
-      mountAs: 'notes',
+      key: 'FLEET_DIR',
+      label: 'Where your agents live',
+      why: "The folder holding your other agents' installs — for you that is your home folder, or a folder above them. Mounted read-only at /workspace/mounts/fleet so Quartermaster can read their logs, configs and source when it is working out why one has gone quiet. Read-only on purpose: it diagnoses and hands you the command, it does not reach into another agent and change it. Leave blank and it can only find out things by asking them in the group chats.",
+      how: [
+        'Pick the folder your agent repos sit in (e.g. /Users/you)',
+        'Narrow it if you would rather it saw less — a folder holding only the agents is better',
+      ],
+      mountAs: 'fleet',
       optional: true,
     },
   ],

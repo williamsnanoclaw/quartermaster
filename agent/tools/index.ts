@@ -4,7 +4,7 @@ import { forget, recall, remember } from './memory.ts';
 import { history } from './history.ts';
 import { schedule, schedules, unschedule } from './schedule.ts';
 import { roomSend, rooms } from './rooms.ts';
-import { postWebhook } from './example.ts';
+import { askAgent, fleet } from './fleet.ts';
 
 /**
  * Every tool the agent can call, in the order it will read them.
@@ -26,5 +26,6 @@ export const tools: Tool[] = [
   schedules,
   rooms,
   roomSend,
-  postWebhook,
+  fleet,
+  askAgent,
 ];
