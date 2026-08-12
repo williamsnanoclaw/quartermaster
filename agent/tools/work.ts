@@ -16,7 +16,14 @@ import { minutesSince, resolveRoom } from './fleet.ts';
  * one does.
  */
 
-const LOOKBACK = 400;
+/**
+ * `ctx.history` clamps to 200 (src/runtime/tools.ts). Asking for more would be
+ * a number that quietly means something else, so this is the real ceiling — and
+ * the fold says out loud when it hits it. An assignment that scrolled out of
+ * the window is one the agent stops chasing without ever knowing it existed,
+ * which is the exact failure this whole file is here to prevent.
+ */
+const LOOKBACK = 200;
 
 type Entry = { at: string; data: Record<string, any> };
 
@@ -38,9 +45,11 @@ type Assignment = {
   closed: { at: string; outcome: string; done: boolean } | null;
 };
 
-async function load(ctx: Ctx): Promise<Assignment[]> {
+async function load(ctx: Ctx) {
   const events = ((await ctx.history(LOOKBACK, 'assignment')) ?? []) as Entry[];
   const byId = new Map<string, Assignment>();
+  /** Events for an assignment whose `opened` has scrolled out of the window. */
+  let orphaned = 0;
 
   // History is newest first; a fold has to replay in the order things happened.
   for (const event of [...events].reverse()) {
@@ -67,7 +76,10 @@ async function load(ctx: Ctx): Promise<Assignment[]> {
     }
 
     const assignment = byId.get(id);
-    if (!assignment) continue; // opened before the lookback window; nothing to fold onto
+    if (!assignment) {
+      orphaned += 1; // opened before the window; there is no record left to fold onto
+      continue;
+    }
     if (data.event === 'followed_up') {
       assignment.chases += 1;
       assignment.lastSentAt = event.at;
@@ -84,7 +96,7 @@ async function load(ctx: Ctx): Promise<Assignment[]> {
     }
   }
 
-  return [...byId.values()];
+  return { list: [...byId.values()], saturated: events.length >= LOOKBACK, orphaned };
 }
 
 /** Ages attached to everything, because an age is the difference between an observation and a guess. */
@@ -173,7 +185,7 @@ export const followUp = defineTool<{ id: string; message: string }>({
     message: { type: 'string', description: 'What to say. Short — the human reads this room too.' },
   }),
   run: async (args, ctx) => {
-    const list = await load(ctx);
+    const { list } = await load(ctx);
     const assignment = list.find((a) => a.id === args.id);
     if (!assignment || assignment.closed) return noSuchAssignment(args.id, list);
 
@@ -216,7 +228,7 @@ export const heard = defineTool<{ id: string; what_they_said: string }>({
     },
   }),
   run: async (args, ctx) => {
-    const list = await load(ctx);
+    const { list } = await load(ctx);
     const assignment = list.find((a) => a.id === args.id);
     if (!assignment || assignment.closed) return noSuchAssignment(args.id, list);
     await ctx.note('assignment', { event: 'heard', id: args.id, text: args.what_they_said });
@@ -236,7 +248,7 @@ export const closeAssignment = defineTool<{ id: string; outcome: string; done: b
     done: { type: 'boolean', description: 'True only if the work was actually completed.' },
   }),
   run: async (args, ctx) => {
-    const list = await load(ctx);
+    const { list } = await load(ctx);
     const assignment = list.find((a) => a.id === args.id);
     if (!assignment || assignment.closed) return noSuchAssignment(args.id, list);
     await ctx.note('assignment', { event: 'closed', id: args.id, outcome: args.outcome, done: args.done });
@@ -259,7 +271,7 @@ export const assignments = defineTool<{ include_closed?: boolean }>({
     },
   }),
   run: async (args, ctx) => {
-    const list = await load(ctx);
+    const { list, saturated, orphaned } = await load(ctx);
     const live = open(list).map(view);
     return {
       checkedAt: new Date().toISOString(),
@@ -267,6 +279,16 @@ export const assignments = defineTool<{ include_closed?: boolean }>({
       overdue: live.filter((a) => a.overdue).map((a) => a.id),
       neverAnsweredCount: live.filter((a) => !a.heardAnything).length,
       closed: args.include_closed ? list.filter((a) => a.closed).map(view) : undefined,
+      // Saying this out loud matters more than the list itself: a short list
+      // read as "nothing outstanding" is how a dropped request stays dropped.
+      incomplete: saturated || orphaned > 0 || undefined,
+      incompleteWhy:
+        saturated || orphaned > 0
+          ? `This list is not everything. The journal window holds ${LOOKBACK} assignment events and it is full` +
+            (orphaned ? `, and ${orphaned} event(s) belong to assignments older than it` : '') +
+            '. Older open assignments are missing here. Close what is finished so the window clears, and ' +
+            'search `history` before telling him nothing is outstanding.'
+          : undefined,
     };
   },
 });

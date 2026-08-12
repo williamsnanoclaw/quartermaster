@@ -136,6 +136,26 @@ const ROOMS = [
   console.log('ok  orphaned events do not crash the fold');
 }
 
+// 9b. a full journal window is reported, never read as "nothing outstanding"
+{
+  const ctx = makeCtx();
+  for (let i = 0; i < 200; i += 1) ctx.at(30, 'assignment', { event: 'heard', id: `old-${i}`, text: 'x' });
+  const list = await assignments.run({}, ctx);
+  assert.equal(list.open.length, 0);
+  assert.equal(list.incomplete, true, 'an empty list off a saturated window must not read as clean');
+  assert.match(list.incompleteWhy, /not everything/);
+  console.log('ok  a truncated view says so instead of looking empty');
+}
+
+// 9c. a small window stays silent — the warning has to mean something
+{
+  const ctx = makeCtx();
+  await delegate.run({ agent: 'Librarian', request: 'check my email' }, ctx);
+  const list = await assignments.run({}, ctx);
+  assert.equal(list.incomplete, undefined);
+  console.log('ok  no false alarm when the window is not full');
+}
+
 // 10. fleet reports live rooms with ages attached
 {
   const ctx = makeCtx();
