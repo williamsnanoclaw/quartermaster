@@ -98,7 +98,7 @@ function Wizard({
 
   return (
     <Box flexDirection="column" paddingX={1} paddingY={1}>
-      <Text bold>{`temper — ${manifest.tagline}`}</Text>
+      <Text bold>{`${manifest.name} — ${manifest.tagline}`}</Text>
       <Text dimColor>{`setting up · ${index + 1} of ${settings.length}`}</Text>
 
       <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="cyan" paddingX={2} paddingY={1}>
@@ -132,9 +132,13 @@ function Wizard({
       <Box marginTop={1}>
         <Text color="cyan">{'› '}</Text>
         <Text>{shown}</Text>
-        <Text inverse>{' '}</Text>
+        <Text inverse> </Text>
       </Box>
-      {error ? <Text color="red">{`  ${error}`}</Text> : <Text dimColor>{`  ${optional ? 'enter to skip' : 'required'}`}</Text>}
+      {error ? (
+        <Text color="red">{`  ${error}`}</Text>
+      ) : (
+        <Text dimColor>{`  ${optional ? 'enter to skip' : 'required'}`}</Text>
+      )}
     </Box>
   );
 }

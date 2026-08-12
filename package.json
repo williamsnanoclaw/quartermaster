@@ -1,11 +1,11 @@
 ﻿{
-  "name": "temper",
+  "name": "quartermaster",
   "version": "0.1.0",
-  "description": "A boilerplate for terse, sandboxed agents that live in your terminal.",
+  "description": "An agent that manages and observes a company of agents. Built on temper.",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "temper": "dist/src/cli.js"
+    "quartermaster": "dist/src/cli.js"
   },
   "engines": {
     "node": ">=24"

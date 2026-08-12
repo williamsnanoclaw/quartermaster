@@ -3,8 +3,9 @@ import { ask, notify, status } from './human.ts';
 import { forget, recall, remember } from './memory.ts';
 import { history } from './history.ts';
 import { schedule, schedules, unschedule } from './schedule.ts';
-import { roomSend, rooms } from './rooms.ts';
-import { askAgent, fleet } from './fleet.ts';
+import { roomSend } from './rooms.ts';
+import { fleet } from './fleet.ts';
+import { assignments, closeAssignment, delegate, followUp, heard } from './work.ts';
 
 /**
  * Every tool the agent can call, in the order it will read them.
@@ -24,8 +25,11 @@ export const tools: Tool[] = [
   schedule,
   unschedule,
   schedules,
-  rooms,
   roomSend,
   fleet,
-  askAgent,
+  delegate,
+  followUp,
+  heard,
+  closeAssignment,
+  assignments,
 ];

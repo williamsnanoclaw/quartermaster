@@ -15,14 +15,17 @@ import { Dashboard, type Bridge } from './ui/app.tsx';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const name = manifest.name;
 
-const HELP = `
-  temper — ${manifest.tagline}
+/** The command they type. Kept in step with `bin` in package.json. */
+const cli = manifest.name;
 
-  temper           start the agent (this is the one you want)
-  temper setup     walk through every setting again
-  temper login     forget the Codex login and sign in fresh
-  temper build     rebuild the container image
-  temper reset     delete the agent's workspace — memory, journal, schedules
+const HELP = `
+  ${cli} — ${manifest.tagline}
+
+  ${cli}           start the agent (this is the one you want)
+  ${cli} setup     walk through every setting again
+  ${cli} login     forget the Codex login and sign in fresh
+  ${cli} build     rebuild the container image
+  ${cli} reset     delete the agent's workspace — memory, journal, schedules
 
   The agent runs in Docker and lives as long as this terminal does.
 `;
@@ -40,8 +43,22 @@ switch (command) {
     console.log('image ready');
     break;
   case 'login':
-    spawnSync('docker', ['run', '--rm', '--entrypoint', 'rm', '-v', `temper-${name}:/workspace`, await ensureImage(root, name), '-f', '/workspace/.codex/auth.json'], { stdio: 'inherit' });
-    console.log('signed out. run `temper` to sign in again.');
+    spawnSync(
+      'docker',
+      [
+        'run',
+        '--rm',
+        '--entrypoint',
+        'rm',
+        '-v',
+        `temper-${name}:/workspace`,
+        await ensureImage(root, name),
+        '-f',
+        '/workspace/.codex/auth.json',
+      ],
+      { stdio: 'inherit' },
+    );
+    console.log(`signed out. run \`${cli}\` to sign in again.`);
     break;
   case 'reset':
     await reset();
@@ -59,7 +76,9 @@ switch (command) {
 
 async function reset() {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(`This deletes ${name}'s memory, journal and schedules. Type the agent's name to confirm: `);
+  const answer = await rl.question(
+    `This deletes ${name}'s memory, journal and schedules. Type the agent's name to confirm: `,
+  );
   rl.close();
   if (answer.trim() !== name) return console.log('left alone.');
   spawnSync('docker', ['rm', '-f', `temper-${name}`], { stdio: 'ignore' });
@@ -69,7 +88,9 @@ async function reset() {
 
 async function up(reconfigure: boolean) {
   if (!has('docker')) {
-    console.error('Docker is not installed, and the agent only runs in Docker.\nGet it: https://docs.docker.com/get-docker/');
+    console.error(
+      'Docker is not installed, and the agent only runs in Docker.\nGet it: https://docs.docker.com/get-docker/',
+    );
     process.exit(1);
   }
   if (spawnSync('docker', ['info'], { stdio: 'ignore' }).status !== 0) {
@@ -100,7 +121,10 @@ async function up(reconfigure: boolean) {
       return () => listeners.delete(listener);
     },
   };
-  child.stdout?.on('data', lineReader<ToHost>((message) => listeners.forEach((l) => l(message))));
+  child.stdout?.on(
+    'data',
+    lineReader<ToHost>((message) => listeners.forEach((l) => l(message))),
+  );
 
   // Container stderr is not protocol; keep the tail so a crash is explainable.
   let stderr = '';
