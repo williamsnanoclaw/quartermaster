@@ -13,7 +13,7 @@ import type { Manifest } from '../src/config.ts';
  */
 export const manifest: Manifest = {
   name: 'quartermaster',
-  tagline: 'manages and observes your company of agents',
+  tagline: 'hands work to your agents and makes sure it lands',
 
   settings: [
     {
