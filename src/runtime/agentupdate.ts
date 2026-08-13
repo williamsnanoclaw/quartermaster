@@ -28,6 +28,35 @@ const list = (result: any, key: string): any[] =>
 /** whoami has moved shape before; take the name from wherever it is. */
 export const nameOf = (whoami: any): string | null => whoami?.agent?.name ?? whoami?.name ?? null;
 
+/** Their limit is 8000 characters a message. Leaves room for nothing clever. */
+const LIMIT = 7_800;
+
+/**
+ * Split a long answer rather than shorten it. Truncating at 8000 loses the end
+ * of a list silently, and silence at the end of a list is indistinguishable
+ * from an agent that stopped early — which is the thing this runtime exists to
+ * make impossible. Breaks where the text already breaks.
+ */
+export function chunks(text: string): string[] {
+  if (text.length <= LIMIT) return [text];
+  const parts: string[] = [];
+  let rest = text;
+  while (rest.length > LIMIT) {
+    const window = rest.slice(0, LIMIT);
+    // In preference order, not whichever lies furthest right — a space is nearly
+    // always to the right of a paragraph break, so taking the maximum split "9."
+    // from item nine's text and left the number stranded at the end of a message.
+    const at =
+      [window.lastIndexOf('\n\n'), window.lastIndexOf('\n'), window.lastIndexOf(' ')].find(
+        (seam) => seam > LIMIT / 2,
+      ) ?? LIMIT;
+    parts.push(rest.slice(0, at).trim());
+    rest = rest.slice(at).trim();
+  }
+  if (rest) parts.push(rest);
+  return parts;
+}
+
 export class AgentUpdate {
   readonly enabled: boolean;
   private token: string;
@@ -69,22 +98,49 @@ export class AgentUpdate {
 
   whoami = () => this.call('/v1/agent/whoami');
 
-  send = (text: string) =>
-    this.call('/v1/agent/messages', {
-      method: 'POST',
-      body: JSON.stringify({ text: text.slice(0, 8000), nonce: crypto.randomUUID() }),
-    });
+  /**
+   * Outbound, and it does not give up quietly.
+   *
+   * `call` fails fast while a backoff is armed, which is right for polling — no
+   * sense hammering a limit we are already over. It is wrong for an answer the
+   * human is waiting on: one throttled poll would delete it, and he would see an
+   * agent that said nothing. So this waits the backoff out instead. The nonce is
+   * made once and reused, so a retry after a lost response is not a second copy.
+   */
+  private async deliver(path: string, body: Record<string, unknown>): Promise<any> {
+    if (!this.enabled) return null;
+    const payload = JSON.stringify({ ...body, nonce: crypto.randomUUID() });
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const wait = this.backoffUntil - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(wait, 65_000)));
+      const result = await this.call(path, { method: 'POST', body: payload });
+      if (result) return result;
+      // No backoff armed means they refused it on the merits. Trying again with
+      // the same body just spends another round trip on the same answer.
+      if (Date.now() >= this.backoffUntil) return null;
+    }
+    return null;
+  }
 
-  /** Posts a question with tappable options. Returns its message id. */
+  /** False means it did not land, and somebody upstream has to say so. */
+  send = async (text: string): Promise<boolean> => {
+    for (const part of chunks(text)) {
+      if (!(await this.deliver('/v1/agent/messages', { text: part }))) return false;
+    }
+    return this.enabled;
+  };
+
+  /**
+   * Posts a question with tappable options. Returns its message id.
+   *
+   * Not chunked: the options ride on one message, and splitting would leave the
+   * taps attached to a fragment. A question too long to fit is the agent's bug.
+   */
   async ask(question: string, options?: string[]): Promise<string | null> {
-    const result = await this.call('/v1/agent/messages', {
-      method: 'POST',
-      body: JSON.stringify({
-        text: question.slice(0, 8000),
-        kind: 'question',
-        nonce: crypto.randomUUID(),
-        ...(options?.length ? { options: options.slice(0, 6).map((o) => o.slice(0, 48)) } : {}),
-      }),
+    const result = await this.deliver('/v1/agent/messages', {
+      text: question.slice(0, 8000),
+      kind: 'question',
+      ...(options?.length ? { options: options.slice(0, 6).map((o) => o.slice(0, 48)) } : {}),
     });
     return result?.id ?? null;
   }
@@ -97,11 +153,12 @@ export class AgentUpdate {
 
   rooms = async (): Promise<Room[]> => list(await this.call('/v1/agent/rooms'), 'rooms');
 
-  sendRoom = (roomId: string, text: string) =>
-    this.call(`/v1/agent/rooms/${roomId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ text: text.slice(0, 8000), nonce: crypto.randomUUID() }),
-    });
+  sendRoom = async (roomId: string, text: string): Promise<boolean> => {
+    for (const part of chunks(text)) {
+      if (!(await this.deliver(`/v1/agent/rooms/${roomId}/messages`, { text: part }))) return false;
+    }
+    return this.enabled;
+  };
 
   /**
    * Everything new since the stored cursor, oldest first. The caller decides

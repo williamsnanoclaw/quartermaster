@@ -1,7 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { runTurn, type TurnHandlers, type TurnResult } from './codex.ts';
 import { corrections } from './corrections.ts';
 import { journal } from './journal.ts';
 import { memory } from './memory.ts';
+import { paths } from './workspace.ts';
 
 /**
  * One long conversation, kept alive across weeks.
@@ -14,7 +17,11 @@ import { memory } from './memory.ts';
  * written down. That is why memory is a folder and not a scrollback.
  */
 // Read at call time, not at import: settings can change under a running agent.
-const tokenCeiling = () => Number(process.env.TEMPER_ARC_TOKENS ?? 220_000);
+// The ceiling counts new content added to the thread — see `run` — so it is not
+// comparable to the old one, which counted the same thread over and over. On a
+// delegating workload this is roughly fifteen to twenty turns an arc, where the
+// old number bought three.
+const tokenCeiling = () => Number(process.env.TEMPER_ARC_TOKENS ?? 600_000);
 const turnCeiling = () => Number(process.env.TEMPER_ARC_TURNS ?? 60);
 const INDEX_LIMIT = 200;
 
@@ -49,9 +56,21 @@ export const session = {
     if (!result.error) pending = pending.filter((note) => !carried.includes(note));
 
     this.turns += 1;
-    // A high-water mark: a cheap turn after an expensive one does not mean the
-    // thread got smaller.
-    this.tokens = Math.max(this.tokens, result.usage?.input_tokens ?? 0);
+    // What the thread grew by, not what the turn cost.
+    //
+    // `input_tokens` is summed over every model call inside the turn, so a turn
+    // with ten tool calls reports ten replays of the same thread and reads as a
+    // thread ten times the size. Taking the high-water mark of that number is
+    // why arcs were rotating every third turn — 554k measured against a 220k
+    // ceiling on a thread that was nothing like 554k long. The agent was losing
+    // its memory for being busy, not for being old.
+    //
+    // New content is uncached exactly once and cached forever after, so
+    // uncached input plus output is the part that stayed in the thread.
+    const usage = result.usage;
+    if (usage) {
+      this.tokens += Math.max(0, usage.input_tokens - usage.cached_input_tokens) + usage.output_tokens;
+    }
     journal.set('arc.turns', String(this.turns));
     journal.set('arc.tokens', String(this.tokens));
     journal.record('turn', { error: result.error, usage: result.usage, chars: result.text.length });
@@ -94,14 +113,35 @@ export const session = {
   },
 };
 
-/** The opening context of a new arc. AGENTS.md and NORTH_STAR.md load themselves. */
+/** Read the agent's own copy, from the read-only mount rather than the folder. */
+const doc = (file: string) => {
+  try {
+    return readFileSync(join('/app/agent', file), 'utf8').trim();
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * The opening context of a new arc.
+ *
+ * AGENTS.md and NORTH_STAR.md are put in here rather than left to load
+ * themselves. Codex looks for a project doc starting at the working directory,
+ * and that is now the human's folder — so it would find *their* AGENTS.md, if
+ * they have one, and never ours. Reading them in is the only version of this
+ * that does not depend on whose repo the agent was started in.
+ */
 function seed(): string {
   const notes = memory.index();
   const shown = notes.slice(0, INDEX_LIMIT);
   const handoff = memory.read('session-handoff');
+  const northStar = doc('NORTH_STAR.md');
+  const agents = doc('AGENTS.md');
   return [
     `Session started ${new Date().toISOString()} (${process.env.TEMPER_TZ ?? 'UTC'}).`,
-    'Working directory is /workspace. AGENTS.md is how you operate; NORTH_STAR.md is why you exist.',
+    `Working directory is ${paths.root}, a real folder on the human's machine. Your own files are in ${paths.home}.`,
+    northStar ? `# NORTH_STAR.md — why you exist\n\n${northStar}` : '',
+    agents ? `# AGENTS.md — how you operate\n\n${agents}` : '',
     // Re-asserted on every arc, so compaction can never quietly repeal a rule.
     corrections.render(),
     notes.length

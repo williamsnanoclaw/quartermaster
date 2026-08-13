@@ -21,7 +21,8 @@ import { schedules } from './schedules.ts';
 export type Deps = {
   /** Resolves to null when the human never answered. Never a default answer. */
   ask: (question: string, options?: string[]) => Promise<string | null>;
-  notify: (text: string) => Promise<void>;
+  /** False when the message did not land. The agent is told, never reassured. */
+  notify: (text: string) => Promise<boolean>;
   status: (patch: Partial<Pick<Status, 'detail' | 'metrics'>> & { state?: State }) => void;
   rooms: { list: () => Promise<unknown>; send: (roomId: string, text: string) => Promise<unknown> };
   /** Held in memory by the supervisor; never in the container's environment. */

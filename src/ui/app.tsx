@@ -29,7 +29,13 @@ export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name:
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [name, setName] = useState(initialName);
-  const [status, setStatus] = useState<Status>({ state: 'booting', detail: 'starting the container', metrics: {}, since: Date.now(), next: null });
+  const [status, setStatus] = useState<Status>({
+    state: 'booting',
+    detail: 'starting the container',
+    metrics: {},
+    since: Date.now(),
+    next: null,
+  });
   const [feed, setFeed] = useState<Entry[]>([]);
   const [ask, setAsk] = useState<Ask | null>(null);
   const [signIn, setSignIn] = useState<string[]>([]);
@@ -62,7 +68,9 @@ export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name:
             setFeed((f) => upsertActivity(f, message.activity));
             break;
           case 'notice':
-            setFeed((f) => cap([...f, { key: crypto.randomUUID(), kind: 'notice', level: message.level, text: message.text }]));
+            setFeed((f) =>
+              cap([...f, { key: crypto.randomUUID(), kind: 'notice', level: message.level, text: message.text }]),
+            );
             break;
           case 'ask':
             setAsk({ id: message.id, question: message.question, options: message.options });
@@ -138,7 +146,7 @@ export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name:
       <Box marginTop={1}>
         <Text color="cyan">{'› '}</Text>
         <Text>{draft}</Text>
-        <Text inverse>{' '}</Text>
+        <Text inverse> </Text>
       </Box>
       <Text dimColor>
         {`  enter send · /correct <rule> standing order · esc interrupt · ctrl-c quit${ask ? ' · answering the question above' : ''}`}
@@ -248,11 +256,10 @@ function upsertActivity(feed: Entry[], activity: Activity): Entry[] {
 }
 
 /** Take entries from the end until the screen is full. Long messages wrap. */
-function fit(feed: Entry[], width: number, budget: number): Entry[] {
+export function fit(feed: Entry[], width: number, budget: number): Entry[] {
   const columns = Math.max(20, width);
   const height = (entry: Entry) => {
-    const text =
-      entry.kind === 'msg' ? entry.msg.text : entry.kind === 'activity' ? entry.activity.text : entry.text;
+    const text = entry.kind === 'msg' ? entry.msg.text : entry.kind === 'activity' ? entry.activity.text : entry.text;
     // Agent replies are markdown. Counting characters and ignoring newlines
     // undercounts a bulleted list by an order of magnitude, and the frame
     // overflows the alt screen.
@@ -262,11 +269,39 @@ function fit(feed: Entry[], width: number, budget: number): Entry[] {
   let used = 0;
   for (let index = feed.length - 1; index >= 0; index--) {
     const entry = feed[index]!;
-    used += height(entry);
-    if (used > budget) break;
-    shown.unshift(entry);
+    const rows = height(entry);
+    // The newest entry goes in whatever it costs, and is trimmed to fit rather
+    // than skipped. Breaking here on the first pass returned an empty list, so
+    // a long answer rendered as a blank screen — the agent looked like it had
+    // said nothing at exactly the moment it had the most to say.
+    if (shown.length && used + rows > budget) break;
+    shown.unshift(shown.length === 0 && rows > budget ? trim(entry, columns, budget) : entry);
+    used += Math.min(rows, budget);
+    if (used >= budget) break;
   }
   return shown;
+}
+
+/**
+ * Keep the tail of an entry too tall for the screen, and say how much is gone.
+ * The whole thing is in the journal and already on his phone; this is a
+ * viewport, so the one unacceptable outcome is showing nothing and implying
+ * there was nothing.
+ */
+function trim(entry: Entry, columns: number, budget: number): Entry {
+  const text = entry.kind === 'msg' ? entry.msg.text : entry.kind === 'activity' ? entry.activity.text : entry.text;
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let rows = 1; // the marker line
+  for (let index = lines.length - 1; index >= 0 && rows < budget; index--) {
+    kept.unshift(lines[index]!);
+    rows += Math.max(1, Math.ceil(lines[index]!.length / columns));
+  }
+  const hidden = lines.length - kept.length;
+  const shown = [`… ${hidden} earlier line${hidden === 1 ? '' : 's'} — full text on your phone`, ...kept].join('\n');
+  if (entry.kind === 'msg') return { ...entry, msg: { ...entry.msg, text: shown } };
+  if (entry.kind === 'activity') return { ...entry, activity: { ...entry.activity, text: shown } };
+  return { ...entry, text: shown };
 }
 
 /** "2" means the second option. Anything else is taken at face value. */

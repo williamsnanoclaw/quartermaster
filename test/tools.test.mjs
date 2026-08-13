@@ -1,4 +1,15 @@
 import assert from 'node:assert';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Runtime modules open the journal at import time, against a path that only
+// exists inside the container. Point them at scratch so a test can import one
+// without a Docker daemon in the way. Must run before any of them load.
+const scratch = mkdtempSync(join(tmpdir(), 'temper-test-'));
+mkdirSync(join(scratch, '.quartermaster'), { recursive: true });
+process.env.TEMPER_WORKSPACE = scratch;
+
 const D = new URL('../dist/agent/tools', import.meta.url).href;
 const { fleet } = await import(`${D}/fleet.js`);
 const { assignments, closeAssignment, delegate, followUp, heard } = await import(`${D}/work.js`);
@@ -246,6 +257,77 @@ const ROOMS = [
   const out = await fleet.run({}, makeCtx([]));
   assert.match(out.note, /No rooms/);
   console.log('ok  empty fleet is flagged, not reported as fine');
+}
+
+// 12. a failed turn is sorted into what to do about it, not just reported.
+//     The capacity string is Codex's own, verbatim — a turn died on it in
+//     production and took the human's message with it.
+{
+  const R = new URL('../dist/src/runtime', import.meta.url).href;
+  const { isAuthFailure, isCapacity, isTransient } = await import(`${R}/codex.js`);
+  const capacity = 'Selected model is at capacity. Please try a different model.';
+
+  assert.equal(isCapacity(capacity), true);
+  assert.equal(isTransient(capacity), false, 'capacity must not be retried on the same model');
+  assert.equal(isAuthFailure(capacity), false);
+  assert.equal(isCapacity('no such file or directory'), false);
+
+  assert.equal(isTransient('request timed out'), true);
+  assert.equal(isTransient('upstream returned 503'), true);
+  assert.equal(isTransient('the model declined to answer'), false, 'a real refusal is not a blip');
+  assert.equal(isAuthFailure('401 unauthorized'), true);
+  console.log('ok  a full model, a stale token and a blip are told apart');
+}
+
+// 13. stepping aside actually moves, and moves back if the other one is full too
+{
+  const R = new URL('../dist/src/runtime', import.meta.url).href;
+  delete process.env.TEMPER_MODEL; // no /app/agent/codex.toml out here; the pair decides
+  const { model } = await import(`${R}/codex.js`);
+
+  assert.equal(model.current(), 'gpt-5.6-terra', 'terra is the one it prefers');
+  assert.deepEqual(model.stepAside(), { from: 'gpt-5.6-terra', to: 'gpt-5.6-luna' });
+  assert.equal(model.current(), 'gpt-5.6-luna', 'the step has to stick, or the next turn is full again');
+  assert.deepEqual(model.stepAside(), { from: 'gpt-5.6-luna', to: 'gpt-5.6-terra' });
+  assert.ok(!model.current().includes('sol'), 'sol is not one of the two');
+  console.log('ok  a full model steps to the other one and stays there');
+}
+
+// 14. a long answer is split, not shortened — the bug that ate a 16-item list
+{
+  const R = new URL('../dist/src/runtime', import.meta.url).href;
+  const { chunks } = await import(`${R}/agentupdate.js`);
+
+  assert.deepEqual(chunks('short'), ['short'], 'anything that fits is left alone');
+
+  const items = Array.from({ length: 16 }, (_, i) => `${i + 1}. ${'x'.repeat(900)}`);
+  const parts = chunks(items.join('\n\n'));
+
+  assert.ok(parts.length > 1, 'a 14k answer has to become more than one message');
+  for (const part of parts) assert.ok(part.length <= 7_800, 'no part may exceed what the API takes');
+  for (let n = 1; n <= 16; n++) {
+    const hits = parts.filter((p) => p.includes(`\n${n}. `) || p.startsWith(`${n}. `)).length;
+    assert.equal(hits, 1, `item ${n} must survive exactly once — truncation lost the tail of the list`);
+  }
+  console.log('ok  a long answer is split across messages, and no item is lost');
+}
+
+// 15. the newest message renders even when it is taller than the screen
+{
+  const U = new URL('../dist/src/ui', import.meta.url).href;
+  const { fit } = await import(`${U}/app.js`);
+
+  const msg = (id, text) => ({ key: id, kind: 'msg', msg: { id, role: 'agent', text, source: 'terminal', at: 0 } });
+  const tall = msg('long', Array.from({ length: 40 }, (_, i) => `${i + 1}. a line of the answer`).join('\n'));
+
+  const shown = fit([msg('a', 'earlier'), tall], 72, 12);
+  assert.ok(shown.length > 0, 'a reply taller than the budget used to render an empty screen');
+  assert.equal(shown[shown.length - 1].msg.text.includes('40. a line of the answer'), true, 'keep the tail');
+  assert.ok(/earlier line/.test(shown[shown.length - 1].msg.text), 'and say how much is hidden');
+
+  const small = fit([msg('a', 'one'), msg('b', 'two')], 72, 12);
+  assert.deepEqual(small.map((e) => e.key), ['a', 'b'], 'entries that fit are untouched');
+  console.log('ok  a reply too tall for the terminal is trimmed, never blanked');
 }
 
 console.log('\nall passed');

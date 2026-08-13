@@ -67,8 +67,8 @@ export const defineTool = <Args>(tool: Tool<Args>): Tool<Args> => tool;
 export type Ctx = {
   /** Ask the human and wait. Reaches the terminal and their phone. */
   ask(question: string, options?: string[]): Promise<string>;
-  /** Tell the human something. Does not wait. */
-  notify(text: string): Promise<void>;
+  /** Tell the human something. Does not wait. False means it did not land. */
+  notify(text: string): Promise<boolean>;
   /** Update the dashboard. Any subset. */
   status(patch: Partial<Pick<Status, 'detail' | 'metrics'>> & { state?: State }): Promise<void>;
   remember(note: { id: string; title?: string; body: string; tags?: string[] }): Promise<unknown>;

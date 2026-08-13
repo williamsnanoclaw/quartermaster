@@ -7,7 +7,9 @@ export const ask = defineTool<{ question: string; options?: string[] }>({
   name: 'ask',
   description:
     'Ask the human a question and wait for the answer. Use this before anything that affects them, ' +
-    'and whenever a guess would be expensive to get wrong. Reaches their terminal and their phone. ' +
+    'and whenever a guess would be expensive to get wrong. It reaches their terminal and lands on ' +
+    'their phone as a question with tappable answers — so this, not a sentence ending in "Approve?", ' +
+    'is how you ask permission. Asking in a plain message means nothing to tap and no answer coming. ' +
     'One question, one sentence. If they are away for an hour it comes back saying nobody answered — ' +
     'that is not a yes; work around it and leave the question open.',
   input: input({
@@ -15,7 +17,9 @@ export const ask = defineTool<{ question: string; options?: string[] }>({
     options: {
       type: 'array',
       items: 'string',
-      description: 'Up to 6 tappable answers, 48 characters each. Offer them when the answer is a choice.',
+      description:
+        'Up to 6 tappable answers, 48 characters each. Always give them for a yes/no or an approval — ' +
+        'that is the difference between one tap and them having to type.',
       optional: true,
     },
   }),
@@ -25,13 +29,19 @@ export const ask = defineTool<{ question: string; options?: string[] }>({
 export const notify = defineTool<{ text: string }>({
   name: 'notify',
   description:
-    'Send the human one line, no reply expected. For things worth interrupting them over. ' +
-    'If it can wait for the next time they look at the terminal, do not use this.',
+    'Send the human one line on their phone when they did not ask you anything — a scheduled job ' +
+    'that found something worth waking them for, or work that finished long after they stopped ' +
+    "watching. You do not need it in a turn they started, or in one a peer agent's reply woke you " +
+    'for: everything you say already goes back to wherever they are, the moment you say it, so ' +
+    'calling this as well sends it twice. It carries one line, so it can say that an answer exists ' +
+    'but never the answer — if you are announcing a result, send the result instead. Every call is ' +
+    'a buzz on a lock screen, and one that says "on it" or "step two done" spends their attention ' +
+    'and returns nothing. If you would not wake them for it, do not send it.',
   input: input({ text: { type: 'string', description: 'One sentence. It lands on a lock screen.' } }),
-  run: async (args, ctx) => {
-    await ctx.notify(args.text);
-    return 'sent';
-  },
+  run: async (args, ctx) =>
+    (await ctx.notify(args.text))
+      ? 'sent'
+      : 'NOT sent — his phone did not accept it. Say it in your reply instead, and tell him it failed.',
 });
 
 export const status = defineTool<{ state?: State; detail?: string; metrics?: Record<string, string> }>({

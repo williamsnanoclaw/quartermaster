@@ -14,7 +14,16 @@ import {
 import { AgentUpdate, nameOf } from './agentupdate.ts';
 import { serve } from './bus.ts';
 import { corrections } from './corrections.ts';
-import { isAuthFailure, login, loginStatus, logout, writeCodexConfig } from './codex.ts';
+import {
+  isAuthFailure,
+  isCapacity,
+  isTransient,
+  login,
+  loginStatus,
+  logout,
+  model,
+  writeCodexConfig,
+} from './codex.ts';
 import { journal } from './journal.ts';
 import { memory } from './memory.ts';
 import { schedules } from './schedules.ts';
@@ -76,6 +85,78 @@ const waiting = new Map<string, Waiter>();
 let agentUpdate = new AgentUpdate(undefined);
 
 /**
+ * Where this turn's messages go as it speaks, set before the turn starts.
+ *
+ * Empty for a turn the human typed — they are watching the terminal, and their
+ * phone should stay quiet — and empty for one a schedule started, where nobody
+ * is watching anything and `notify` is the deliberate way in.
+ */
+let replyTo: { rooms: string[]; phone: boolean } = { rooms: [], phone: false };
+
+/**
+ * The channel the human last spoke on, and it sticks until he moves.
+ *
+ * He asks from his phone; we hand the work to another agent; the answer arrives
+ * an hour later as that agent's post in a room. That is a turn he did not start,
+ * and its output used to reach nobody — the answer to his own question went to a
+ * dashboard he was not looking at, and the only thing that ever buzzed him was
+ * the agent narrating around the gap with `notify`. For an agent that works by
+ * delegating, that path is not an edge case, it is the job. So where an answer
+ * goes is decided by where *he* is, not by what happened to wake us.
+ */
+let humanChannel: 'terminal' | 'phone' = 'terminal';
+
+/** What already went out this turn, so a recovered turn cannot say it twice. */
+const relayed = new Set<string>();
+
+/**
+ * Everything the agent sends outward queues here, and leaves in the order it
+ * was said. Two overlapping posts can land the wrong way round, and a message
+ * that arrives ahead of the question it answers reads as a different message.
+ * A failure never breaks the chain: the next thing still goes.
+ */
+let outbound: Promise<unknown> = Promise.resolve();
+
+function inOrder<T>(work: () => Promise<T>): Promise<T> {
+  const next = outbound.then(work, work);
+  outbound = next.catch((error: unknown) => journal.record('outbound.failed', { error: String(error) }));
+  return next;
+}
+
+/**
+ * Send a line onward the moment the agent says it, rather than holding the turn
+ * and posting only its last one at the end. A two-minute turn used to be two
+ * minutes of silence wherever they were waiting; now it is however long that
+ * one sentence took to write.
+ */
+function relay(text: string) {
+  const { rooms, phone } = replyTo;
+  if (!rooms.length && !phone) return;
+  // A recovered turn re-runs the same prompt and the agent usually says the
+  // same thing again. One answer is one buzz.
+  if (relayed.has(text)) return;
+  relayed.add(text);
+  void inOrder(async () => {
+    for (const roomId of rooms) {
+      if (!(await agentUpdate.sendRoom(roomId, text))) undelivered(`the ${roomId} room`, text);
+    }
+    if (phone && !(await agentUpdate.send(text))) undelivered('their phone', text);
+  });
+}
+
+/**
+ * Outbound is the one thing that must not fail quietly. A dropped answer is
+ * indistinguishable from an agent that did nothing, and telling those two apart
+ * is the entire job. So a send that did not land is said out loud.
+ */
+function undelivered(where: string, text: string) {
+  journal.record('outbound.dropped', { where, text });
+  if (!agentUpdate.enabled) return; // no phone configured, so nothing was expected to land
+  const shown = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  out({ k: 'notice', level: 'error', text: `could not reach ${where}; this did not land: ${shown}` });
+}
+
+/**
  * Nudge once, then stop waiting. Not configurable, because the right answer
  * doesn't vary by deployment: an unanswered question should cost the human one
  * extra buzz and cost the agent one hour, and no agent should be able to argue
@@ -102,7 +183,9 @@ async function askHuman(question: string, options?: string[]): Promise<string | 
 
   const fromTerminal = new Promise<string>((resolve, reject) => waiting.set(id, { resolve, reject }));
   const fromPhone = (async () => {
-    const messageId = await agentUpdate.ask(question, options);
+    // Behind whatever the agent already said this turn, so the question does not
+    // overtake the sentence that explains it.
+    const messageId = await inOrder(() => agentUpdate.ask(question, options));
     if (!messageId) {
       if (agentUpdate.enabled) {
         out({ k: 'notice', level: 'warn', text: 'could not reach your phone — this question is terminal-only' });
@@ -123,7 +206,9 @@ async function askHuman(question: string, options?: string[]): Promise<string | 
   let giveUp: NodeJS.Timeout | undefined;
   const expiry = new Promise<null>((resolve) => {
     nudge = setTimeout(() => {
-      if (waiting.has(id)) void agentUpdate.send(`still waiting on this: ${question}`);
+      // Behind the queue like everything else, so it cannot overtake the answer
+      // it is chasing and arrive as a reminder about a question already gone.
+      if (waiting.has(id)) void inOrder(() => agentUpdate.send(`still waiting on this: ${question}`));
     }, NUDGE_AFTER);
     giveUp = setTimeout(() => resolve(null), GIVE_UP_AFTER);
   });
@@ -203,6 +288,11 @@ const label = (input: Input) => {
 
 function enqueue(input: Input) {
   queue.push(input);
+  // Only the human moves this — a peer's post and a schedule are not him. A
+  // room he typed in himself is the app, which is to say his phone.
+  if (!input.from && input.source !== 'schedule') {
+    humanChannel = input.source === 'terminal' ? 'terminal' : 'phone';
+  }
   if (input.from) say('system', `${input.from}: ${input.text}`, input.source);
   else if (input.source !== 'schedule') say('you', input.text, input.source);
   void pump().catch((error: unknown) => {
@@ -222,27 +312,47 @@ async function pump() {
         const prompt = batch.map(label).join('\n\n');
         turnAbort = new AbortController();
         setStatus({ state: 'thinking', detail: 'working on it' });
+        relayed.clear();
 
-        let result = await session.run(prompt, handlers, turnAbort.signal);
+        // Answer where the question came from, so a phone thread stays a thread.
+        // Never back into a peer's room: two agents each answering the other's
+        // answer does not stop, so that stays a deliberate act via `room_send`.
+        //
+        // Not answering the peer is not the same as not answering him, though.
+        // When an agent's reply is what woke us, that reply is the second half
+        // of something he asked for, and what we make of it goes to where he is.
+        const fromPeer = batch.some((i) => i.source === 'room' && i.from);
+        replyTo = {
+          rooms: [...new Set(batch.filter((i) => i.source === 'room' && !i.from).map((i) => i.origin!))],
+          phone: batch.some((i) => i.source === 'phone') || (fromPeer && humanChannel === 'phone'),
+        };
 
-        // Tokens expire during long runs. Recovering beats waking the human.
-        if (result.error && result.errorKind === 'event' && isAuthFailure(result.error) && (await reauth())) {
-          result = await session.run(prompt, handlers, turnAbort.signal);
-        }
+        try {
+          let result = await session.run(prompt, handlers, turnAbort.signal);
 
-        if (result.error) {
-          journal.record('turn.error', { error: result.error });
-          out({ k: 'notice', level: 'error', text: result.error });
-        }
-        // Reply where the message came from, so a phone thread stays a thread.
-        // Never auto-reply to a peer agent: two agents each answering the
-        // other's answer does not stop. Posting back is a deliberate act, so
-        // it goes through `room_send`.
-        if (result.text) {
-          for (const roomId of new Set(batch.filter((i) => i.source === 'room' && !i.from).map((i) => i.origin!))) {
-            void agentUpdate.sendRoom(roomId, result.text);
+          // A turn that dies takes the human's message down with it — the queue
+          // handed it over already, and nothing will ask again. Two recoveries,
+          // because every failure worth surviving here (a stale token, a full
+          // model, a blip on the wire) is one step away from simply working.
+          for (let attempt = 0; attempt < 2 && result.error && result.errorKind === 'event'; attempt++) {
+            if (!(await recover(result.error))) break;
+            result = await session.run(prompt, handlers, turnAbort.signal);
           }
-          if (batch.some((i) => i.source === 'phone')) void agentUpdate.send(result.text);
+
+          if (result.error) {
+            journal.record('turn.error', { error: result.error });
+            out({ k: 'notice', level: 'error', text: result.error });
+            // He is owed an answer wherever he asked, and a turn that died is
+            // the answer. Not `stderr`, which can carry the agent's own shell
+            // output, and not an interrupt, which was him.
+            if (result.errorKind === 'event' || result.errorKind === 'spawn') {
+              relay(`I stopped before finishing — ${result.error}`);
+            }
+          }
+        } finally {
+          // Rotation runs on these same handlers, and a handoff note has no
+          // business landing in someone's group chat.
+          replyTo = { rooms: [], phone: false };
         }
       }
 
@@ -272,6 +382,31 @@ async function reauth(): Promise<boolean> {
   return ok;
 }
 
+/**
+ * One step back from a failed turn, so the same prompt is worth running again.
+ * False when there is nothing left to try and the human should hear the error.
+ */
+async function recover(error: string): Promise<boolean> {
+  // Tokens expire during long runs. Recovering beats waking the human.
+  if (isAuthFailure(error)) return reauth();
+
+  if (isCapacity(error)) {
+    const step = model.stepAside();
+    if (!step) return false;
+    journal.record('model.stepped', step);
+    out({ k: 'notice', level: 'warn', text: `${step.from} is at capacity — switching to ${step.to}` });
+    return true;
+  }
+
+  if (isTransient(error)) {
+    out({ k: 'notice', level: 'warn', text: `${error} — trying again` });
+    await sleep(5_000);
+    return true;
+  }
+
+  return false;
+}
+
 const handlers = {
   onActivity: (activity: Activity) => {
     out({ k: 'activity', activity });
@@ -280,7 +415,10 @@ const handlers = {
     if (activity.status !== 'running') journal.record('did', activity);
     if (status.state === 'thinking') setStatus({ state: 'working' });
   },
-  onMessage: (text: string) => say('agent', text, 'terminal'),
+  onMessage: (text: string) => {
+    say('agent', text, 'terminal');
+    relay(text);
+  },
 };
 
 // ------------------------------------------------------------ tools' access
@@ -291,7 +429,9 @@ const host = toolHost({
   ask: askHuman,
   notify: async (text) => {
     say('agent', text, 'system');
-    await agentUpdate.send(text);
+    const delivered = await inOrder(() => agentUpdate.send(text));
+    if (!delivered) undelivered('their phone', text);
+    return delivered;
   },
   status: (patch) => {
     setStatus(patch);
@@ -421,9 +561,12 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
     chmodSync(file, 0o600);
   }
 
+  // Into the agent's own directory, never the project root — the human's
+  // folder may well have an AGENTS.md of its own, and clobbering it would be
+  // this feature's first and worst bug.
   for (const file of ['AGENTS.md', 'NORTH_STAR.md']) {
     try {
-      copyFileSync(join('/app/agent', file), join(paths.root, file));
+      copyFileSync(join('/app/agent', file), join(paths.home, file));
     } catch {
       // NORTH_STAR.md is optional until the human writes one.
     }
@@ -451,12 +594,22 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
     out({ k: 'notice', level: 'info', text: `${missed.length} scheduled job(s) came due while you were away` });
   }
 
+  // Said on every boot, not just at the top of a fresh arc. A resumed thread
+  // skips the seed, and "the folder you are standing in is the human's real
+  // one" is not a fact that can afford to depend on which case you are in.
+  session.note(
+    `Your working directory ${paths.root} is a folder on the human's machine, mounted live and writable. ` +
+      `Files you change there are their files — no copy, no undo. Your own notes, journal and scratch space ` +
+      `are in ${paths.home}; keep your clutter inside it. Everything outside this folder is out of reach.`,
+  );
+
   // The agent cannot use a folder it doesn't know it has.
   const shared = readdirSync(paths.mounts, { withFileTypes: true }).filter((entry) => entry.isDirectory());
   if (shared.length) {
     session.note(
-      `The human shared these folders with you, and they are real files on their machine: ` +
-        `${shared.map((entry) => `mounts/${entry.name}`).join(', ')}. Treat every write there as an effect: ask first.`,
+      `The human shared these extra folders with you, and they are real files on their machine: ` +
+        `${shared.map((entry) => `.quartermaster/mounts/${entry.name}`).join(', ')}. ` +
+        `Treat every write there as an effect: ask first.`,
     );
   }
 
@@ -475,6 +628,11 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
 
   // Poll their phone and group chats. `polling` stops a slow request from
   // stacking up overlapping fetches that would each replay the same messages.
+  //
+  // 5s, not 15s: this delay is spent before the agent even knows it was spoken
+  // to, and it lands on top of however long the turn then takes. Someone
+  // waiting on a phone reads the whole sum as "it didn't answer". 12 polls a
+  // minute against a 60/min limit still leaves room for everything we send.
   let polling = false;
   if (agentUpdate.enabled && !who) {
     // Keep asking until it answers. The name is what tells our own posts apart
@@ -485,7 +643,7 @@ async function boot(hello: Extract<ToAgent, { k: 'hello' }>) {
     retry.unref();
   }
   if (agentUpdate.enabled) {
-    every(15_000, async () => {
+    every(5_000, async () => {
       if (polling) return;
       polling = true;
       try {
