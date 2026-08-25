@@ -17,9 +17,11 @@ export type Setting = {
   secret?: boolean;
   optional?: boolean;
   /**
-   * A host folder, mounted into the container at /workspace/mounts/<mountAs>.
-   * This is a deliberate hole in the sandbox: the agent's shell writes straight
-   * through it to real files, and no tool gate can see that happen.
+   * An *extra* host folder, on top of the working folder the agent already
+   * has, mounted at .quartermaster/mounts/<mountAs>. Rarely the right answer
+   * now: if the agent needs to see something, start it in a folder that has it.
+   * Read-only by default, and a writable one is a second hole in the sandbox —
+   * the agent's shell writes straight through, and no tool gate sees it.
    */
   mountAs?: string;
   /** Mounts are read-only unless you say otherwise. Say otherwise on purpose. */

@@ -25,7 +25,7 @@ Do not start building tools before the north star exists.
 ## The map
 
 ```
-agent/               yours — this is the agent
+agent/               yours — this is the agent, and the template `init` copies
   NORTH_STAR.md      what it's for. write this first.
   AGENTS.md          how it behaves. edit for this job, keep the voice.
   manifest.ts        every setting, and how a human gets it. drives onboarding.
@@ -37,29 +37,66 @@ examples/            three complete agents — email triage, calendar, business
                      ops. Read one before designing tools; they show the shape.
 
 src/                 the runtime. read it, rarely change it.
-  cli.tsx            host entry: preflight, onboarding, container, dashboard
+  cli.tsx            host entry: preflight, scaffold, onboarding, container
+  paths.ts           install vs project, and the per-folder container id.
+                     every path decision lives here — start here.
   config.ts          the Setting/Manifest types — the full field list for
                      manifest.ts lives here
   docker.ts          container lifecycle — the sandbox boundary
   onboarding.tsx     the first-run wizard
   protocol.ts        the host ↔ container wire format
   ui/app.tsx         the dashboard
+  ui/theme.ts        dashboard colours, keyed off State
   runtime/           runs inside the container
     main.ts          supervisor: turn queue, the human channel, lifecycle
     tools.ts         where tools run, and where the effect gate lives
     codex.ts         spawns Codex, parses its event stream
-    session.ts       thread lifecycle and compaction
+    session.ts       thread lifecycle, compaction, and the arc seed
     memory.ts        markdown notes
+    corrections.ts   standing orders — journal-authoritative, agent can't edit
     schedules.ts     recurring work
     journal.ts       sqlite history
+    workspace.ts     every path inside the container. the other half of paths.ts
     agentupdate.ts   phone + group chats
     bus.ts           socket between the tool server and the supervisor
     mcp.ts           the tool server Codex spawns. a pipe, nothing more.
 ```
 
+## The agent is scoped to one folder
+
+`quartermaster` runs in whatever directory you launched it from. That folder is
+bind-mounted at `/workspace`, **writable**, and it is the only thing the agent
+can reach. Everything the agent owns — its job, its `.env`, its Codex login,
+memory, journal, schedules — lives in `.quartermaster/` inside it.
+
+```
+~/some-project/            ← /workspace. theirs. the agent writes here.
+  .quartermaster/          ← the agent. delete it and the folder is clean.
+    agent/                 a copy of this repo's agent/, mounted read-only
+    .env                   this folder's settings and secrets
+    .codex/                this folder's login — its own, not shared
+    memory/ files/ journal.db schedules.json
+    .gitignore             ignores itself except agent/
+```
+
+Consequences worth holding on to:
+
+- **A folder is an agent.** Two folders are two agents: separate memory,
+  separate token, separate Codex login, running at the same time if you like.
+  Nothing is shared but the Docker image.
+- **First run scaffolds.** `quartermaster` in a bare folder asks once, copies
+  `agent/`, then runs the wizard. `quartermaster init` does the copy alone.
+  `src/paths.ts:tooWide` refuses `$HOME`, `/` and `/Users` outright — a
+  writable mount that wide is not a sandbox.
+- **Never write agent files to `/workspace` itself.** The human's folder may
+  have its own `AGENTS.md`. Everything the runtime writes goes under
+  `paths.home`, never `paths.root`. `paths.root` is theirs.
+- **`agent/` here is a template.** Editing it changes what *new* folders get,
+  not what existing ones run. Existing ones have their own copy.
+
 **One thing that will bite you.** `manifest.ts` is shown to the *human*, during
 setup. Nothing in it reaches the model. If the agent needs to know a setting
-exists — that `mounts/notes` is an Obsidian vault, that there's a Stripe key —
+exists — that the folder it runs in is an Obsidian vault, that there's a Stripe key —
 say so in `NORTH_STAR.md`.
 
 ## Adding a tool
@@ -109,19 +146,34 @@ service — the wizard is the only documentation most people will read.
 
 - `scope: 'gated'` for a credential the container should not hold.
 - `scope: 'runtime'` for something only the supervisor uses.
-- `mountAs` shares a host folder. Read-only unless you add `writable: true`,
-  and a writable mount is a real hole in the sandbox — see the README.
+- `mountAs` shares an *extra* host folder, on top of the working folder the
+  agent already has. Read-only unless you add `writable: true`. Reach for it
+  rarely: the answer to "the agent needs to see X" is usually to run it in a
+  folder that contains X.
+
+Answers are stored per folder in `<project>/.quartermaster/.env`, so the same
+setting can differ between two agents. A newly added required setting is
+prompted for on the next start — `onboarding.tsx` asks only for what is blank.
 
 ## Testing your changes
 
 ```
 npm run check         # types
 npm run build         # host CLI
-npm start -- setup    # walk the wizard as a new user would
-npm start             # run it
+npm test              # the tool suite
 ```
 
-(`npm link` once and it's just `temper`, `temper setup`.)
+Then, from a scratch folder — not this repo:
+
+```
+mkdir /tmp/try && cd /tmp/try
+quartermaster          # scaffolds, asks, then runs
+quartermaster reset    # deletes /tmp/try/.quartermaster
+```
+
+(`npm link` once in the repo and it's on your PATH. Running `npm start` from
+the repo root scaffolds an agent *into the repo* — fine, it's gitignored, but
+it is not the same agent as one in a real folder.)
 
 Watch the dashboard while it works. If the status line goes stale or says
 nothing useful, the problem is your `AGENTS.md`, not the UI.
@@ -130,10 +182,11 @@ nothing useful, the problem is your `AGENTS.md`, not the UI.
 
 `TEMPER_NAME` is what it's called — set it in `.env`, that's all you need.
 
-`manifest.name` is the *installation* id: it names the Docker image, the
-container, and the volume. Changing it after the agent has run orphans its
-memory, journal and schedules in the old volume. If you must, `docker volume ls`
-and move the data across.
+`manifest.name` is the *installation* id: it names the Docker image, prefixes
+the container, and names the agent's directory (`.quartermaster/`) via
+`paths.stateDir`. Change it and existing folders keep their old directory —
+the new name simply won't find them. `mv .oldname .newname` inside each folder
+that matters; there are no Docker volumes to chase any more.
 
 ## House style
 

@@ -1,7 +1,7 @@
 import { defineTool, input } from './_kit.ts';
 
 /**
- * Memory is markdown at /workspace/memory. These tools keep the index honest;
+ * Memory is markdown at .quartermaster/memory. These tools keep the index honest;
  * for anything they do not cover, use the shell — it is your folder.
  */
 

@@ -19,11 +19,22 @@ dispute and one that can only fill in a form.
 git clone https://github.com/wdorman-tech/Temper my-agent
 cd my-agent
 npm install        # also builds
-npm start          # or `npm link` once, then just `temper`, from anywhere
+npm link           # puts `quartermaster` on your PATH
+
+cd ~/the-folder-it-should-work-in
+quartermaster      # scaffolds, asks, then runs
 ```
 
-First run walks you through every setting one screen at a time and tells you
-where to get each one. Then it builds the container and signs you into Codex.
+**The agent is scoped to the folder you start it in.** That folder is its whole
+world: it works there, it can't see anything outside it, and everything it owns
+lives in `.quartermaster/` inside it. Run the command in a different folder and
+you get a different agent — its own job, its own memory, its own login — and the
+two can run side by side.
+
+First run in a folder asks before it creates anything, then walks you through
+every setting one screen at a time and tells you where to get each one. Then it
+builds the container and signs you into Codex. `quartermaster reset` deletes
+that one directory and the folder is clean.
 
 To make it *yours*: point Claude Code at the repo. It'll interview you, write
 the north star, and build the tools. See [CLAUDE.md](CLAUDE.md).
@@ -61,7 +72,7 @@ agent is for.
 per-token bill. The Codex CLI runs the agent loop, so you get its tools, its
 shell and its threads for free.
 
-**Memory that's just files.** `/workspace/memory/*.md`, with an index. The agent
+**Memory that's just files.** `.quartermaster/memory/*.md`, with an index. The agent
 greps its own notes, rewrites them, throws them out. You can read every one with
 `cat`. No embeddings, nothing to reindex, nothing to corrupt.
 
@@ -96,16 +107,26 @@ doesn't cost you the session.
 
 Worth being precise about, because most agent frameworks aren't.
 
-**Hard boundary — the container.** The agent gets a volume and nothing else.
-Your filesystem isn't there. Delete the volume and it's factory-new. The runtime
-is root-owned and read-only to the agent, so the code enforcing the rules isn't
-code the agent can edit. This holds even if the model actively tries to get out.
+**Hard boundary — the container, and one folder.** The agent sees exactly one
+directory of yours: the one you ran the command in, mounted live and writable.
+Nothing else on your machine is reachable — not your home directory, not your
+other projects, not the folder above. The runtime itself is root-owned and
+read-only to the agent, so the code enforcing the rules isn't code the agent can
+edit. This holds even if the model actively tries to get out.
 
-**The one hole you open yourself — mounts.** A host folder you name during setup
-appears at `/workspace/mounts/<name>`, read-only unless you set
-`writable: true`. If you make one writable, know what you've done: the agent's
-shell writes straight through to your real files and **no gate sees it**. Mount
-a copy, or a folder you'd survive losing.
+**Know what that folder is.** It is writable, and the agent's shell writes
+straight through to your real files with **no gate in front of it**. That is the
+point — an agent that has to ask before every edit can't do real work — but pick
+the folder deliberately. Start it in the project you want worked on, not in a
+folder that merely contains it. `$HOME`, `/Users` and `/` are refused outright.
+
+Its own files stay in `.quartermaster/` inside that folder, so `git status` tells
+you exactly what it touched and deleting one directory makes it factory-new.
+
+**An extra folder, if you insist — mounts.** A setting with `mountAs` appears at
+`.quartermaster/mounts/<name>`, read-only unless you set `writable: true`. You
+rarely want this now: the answer to "it needs to see X" is usually to start it
+in a folder that has X.
 
 **Soft boundary — the effect gate.** Tools that reach the outside world ask
 first. They run inside the supervisor rather than the tool server, so a shell

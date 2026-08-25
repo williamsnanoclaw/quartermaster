@@ -57,7 +57,7 @@ export const corrections = {
       ? list.map((c) => `- ${c.at} — ${c.text}`).join('\n')
       : '_None yet. The human adds these with `/correct <text>`._';
     writeFileSync(
-      join(paths.root, 'CORRECTIONS.md'),
+      join(paths.home, 'CORRECTIONS.md'),
       `# Corrections\n\nStanding orders from the human, newest first. You cannot change this file —\n` +
         `it is rewritten from the journal. If one is wrong, say so; don't edit it.\n\n${body}\n`,
     );

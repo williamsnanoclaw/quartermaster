@@ -22,7 +22,7 @@ export async function onboard(
   const todo = manifest.settings.filter((s) => !env[s.key] && (full || (!s.optional && !s.default)));
   if (!todo.length) return env;
 
-  const answers = await new Promise<Record<string, string> | null>((done) => {
+  const answers = await new Promise<Record<string, string> | null>((done, fail) => {
     const app = render(
       <Wizard
         manifest={manifest}
@@ -32,7 +32,14 @@ export async function onboard(
           app.unmount();
         }}
       />,
+      // Ink's own Ctrl-C handler runs before the input reaches useInput, so
+      // leaving it on makes the wizard's cancel branch unreachable.
+      { exitOnCtrlC: false },
     );
+    // Ink can still end the app without going through onDone — a render error,
+    // a stream closing under it. Settling here too keeps a wizard that quits
+    // from leaving the process awaiting a promise nobody will resolve.
+    app.waitUntilExit().then(() => done(null), fail);
   });
 
   // Ctrl-C means "not now", not "I have answered everything". Writing a partial

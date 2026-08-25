@@ -1,5 +1,8 @@
 node_modules/
 dist/
+# Run the CLI inside its own checkout and it scaffolds an agent here like
+# anywhere else. That one is a local instance, not part of the project.
+.quartermaster/
 .env
 .env.local
 *.log

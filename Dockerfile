@@ -34,7 +34,9 @@ COPY src/runtime ./src/runtime
 # the image still runs standalone, e.g. for debugging with `docker run`.
 COPY agent ./agent
 
-ENV CODEX_HOME=/workspace/.codex \
+# Defaults for a bare `docker run`. With the host in front, TEMPER_STATE names
+# the agent's directory and the runtime hands Codex its own CODEX_HOME.
+ENV CODEX_HOME=/workspace/.quartermaster/.codex \
     TEMPER_WORKSPACE=/workspace \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning
 
@@ -45,6 +47,8 @@ RUN useradd -m -u 1001 temper \
     && mkdir -p /workspace \
     && chown -R temper:temper /workspace
 USER temper
-VOLUME /workspace
+# No VOLUME: /workspace is a bind mount of the folder the human started in, and
+# declaring it here would have Docker invent an anonymous volume on any run
+# that forgets the mount — an agent silently writing its memory into nowhere.
 
 ENTRYPOINT ["node", "/app/src/runtime/main.ts"]

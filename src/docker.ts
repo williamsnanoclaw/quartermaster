@@ -54,8 +54,13 @@ export async function ensureImage(root: string, name: string, opts: { force?: bo
 }
 
 export type Launch = {
-  root: string;
-  name: string;
+  /** The human's folder. Becomes /workspace, writable. */
+  project: string;
+  /** <project>/<stateDir>/agent — this folder's job definition. */
+  agentDir: string;
+  /** The agent's own directory, relative to the project. `.quartermaster`. */
+  stateDir: string;
+  container: string;
   tag: string;
   env: Record<string, string>;
   mounts: Array<{ host: string; as: string; readonly: boolean }>;
@@ -66,26 +71,47 @@ export type Launch = {
  * process's pipe, so when your terminal dies, stdin closes, the runtime exits,
  * and Docker removes the container. Nothing survives you.
  */
-export function start({ root, name, tag, env, mounts }: Launch): ChildProcess {
-  const container = `temper-${name}`;
+export function start({ project, agentDir, stateDir, container, tag, env, mounts }: Launch): ChildProcess {
   if (run(['ps', '-q', '-f', `name=^${container}$`]).stdout.trim()) {
-    throw new Error(`${name} is already running in another terminal. Close that one first.`);
+    throw new Error(`This folder's agent is already running in another terminal. Close that one first.`);
   }
   run(['rm', '-f', container]);
 
   const args = [
-    'run', '--rm', '-i', '--init',
-    '--name', container,
+    'run',
+    '--rm',
+    '-i',
+    '--init',
+    '--name',
+    container,
     // A runaway agent should exhaust its own container, not the machine.
-    '--memory', process.env.TEMPER_MEMORY ?? '4g',
-    '--pids-limit', '512',
+    '--memory',
+    process.env.TEMPER_MEMORY ?? '4g',
+    '--pids-limit',
+    '512',
     // Nothing inside can gain privileges it wasn't started with, even via setuid.
-    '--security-opt', 'no-new-privileges',
-    '-v', `temper-${name}:/workspace`,
-    '-v', `${join(root, 'agent')}:/app/agent:ro`,
+    '--security-opt',
+    'no-new-privileges',
+    // The folder is the workspace. Not a named volume: "everything it owns
+    // lives in that folder" is the point, and a volume would hide the agent's
+    // memory and journal somewhere only `docker volume` can reach them.
+    '-v',
+    `${project}:/workspace`,
+    // The job definition, mounted twice. /app/agent is where the runtime reads
+    // it. The second is a read-only lid over the same files inside the
+    // writable project mount: the agent can read its own north star and cannot
+    // quietly rewrite it between one boot and the next.
+    '-v',
+    `${agentDir}:/app/agent:ro`,
+    '-v',
+    `${agentDir}:/workspace/${stateDir}/agent:ro`,
+    // The runtime hangs every one of its paths off this, so the host stays the
+    // single source of truth for where the agent's own directory is.
+    '-e',
+    `TEMPER_STATE=${stateDir}`,
   ];
   for (const mount of mounts) {
-    args.push('-v', `${mount.host}:/workspace/mounts/${mount.as}${mount.readonly ? ':ro' : ''}`);
+    args.push('-v', `${mount.host}:/workspace/${stateDir}/mounts/${mount.as}${mount.readonly ? ':ro' : ''}`);
   }
   for (const [key, value] of Object.entries(env)) {
     args.push('-e', `${key}=${value}`);

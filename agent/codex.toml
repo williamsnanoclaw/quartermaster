@@ -3,8 +3,12 @@
 # Model choice is the biggest lever you have. Higher reasoning costs time and
 # plan usage; for an agent making judgement calls unattended, it is usually
 # worth it. Run `codex --help` or check your plan for available models.
+#
+# The runtime passes this as `-m` on every turn. If it comes back "at capacity"
+# the supervisor steps to the other model of the pair in src/runtime/codex.ts
+# and says so on the dashboard, rather than losing the turn.
 
-model = "gpt-5.6-sol"
+model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
 
 # The agent can search the web. An agent that cannot look things up will
