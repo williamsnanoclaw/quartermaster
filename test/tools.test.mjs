@@ -330,4 +330,24 @@ const ROOMS = [
   console.log('ok  a reply too tall for the terminal is trimmed, never blanked');
 }
 
+// the dashboard never sends Ink looking for the terminal size
+{
+  const U = new URL('../dist/src/ui', import.meta.url).href;
+  const { pinSize } = await import(`${U}/app.js`);
+
+  // Ink calls getWindowSize(stdout) on every render. When the stream cannot
+  // answer, terminal-size opens /dev/tty and never closes it, so a dashboard
+  // that redraws once a second leaks a file descriptor a second until the host
+  // hits the heap limit — and the container goes down with the host.
+  for (const blank of [{}, { columns: 0, rows: 0 }, { columns: undefined, rows: undefined }]) {
+    const stream = pinSize(blank);
+    assert.ok(stream.columns > 0, 'a stream with no width must be given one');
+    assert.ok(stream.rows > 0, 'a stream with no height must be given one');
+  }
+
+  const real = pinSize({ columns: 143, rows: 47 });
+  assert.deepEqual([real.columns, real.rows], [143, 47], 'a terminal that knows its own size is left alone');
+  console.log('ok  the terminal always reports a size, so Ink never goes hunting for one');
+}
+
 console.log('\nall passed');

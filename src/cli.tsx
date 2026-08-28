@@ -20,7 +20,7 @@ import {
   tooWide,
 } from './paths.ts';
 import { encode, lineReader, type ToAgent, type ToHost } from './protocol.ts';
-import { Dashboard, type Bridge } from './ui/app.tsx';
+import { Dashboard, pinSize, type Bridge } from './ui/app.tsx';
 
 const name = manifest.name;
 
@@ -192,6 +192,13 @@ async function up(reconfigure: boolean) {
     env: agent,
     mounts: mounts(manifest, settings),
   });
+
+  // Before Ink starts asking. A terminal that cannot report its size sends Ink
+  // looking for it, and looking for it leaks a file descriptor per frame —
+  // fatal for a dashboard that redraws every second for days. Node refreshes
+  // these itself on a real resize, so pin them again after one.
+  pinSize(process.stdout);
+  process.stdout.on('resize', () => pinSize(process.stdout));
 
   // Full-screen, and give the terminal back exactly as we found it.
   process.stdout.write('\x1b[?1049h');

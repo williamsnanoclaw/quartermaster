@@ -25,6 +25,24 @@ type Ask = { id: string; question: string; options?: string[] };
 
 const FEED_LIMIT = 400;
 
+/**
+ * Make sure the stream can say how wide it is.
+ *
+ * Ink asks the terminal for its size on every render, and when the stream has
+ * no answer the library behind that question opens /dev/tty, wraps it in a
+ * WriteStream, reads the size off it and drops it on the floor — a file
+ * descriptor and a TTY handle leaked per frame. This dashboard redraws once a
+ * second for as long as the agent is up, so a session left running overnight
+ * is killed by the heap limit somewhere in the second day, and the container
+ * dies with the terminal. Ink's own fallback is 80x24; this is that same
+ * guess, made where the question is asked instead of where it leaks.
+ */
+export function pinSize<T extends { columns?: number; rows?: number }>(stream: T): T {
+  if (!stream.columns) stream.columns = 80;
+  if (!stream.rows) stream.rows = 24;
+  return stream;
+}
+
 export function Dashboard({ bridge, name: initialName }: { bridge: Bridge; name: string }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
