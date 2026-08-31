@@ -3,11 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { render } from 'ink';
 import { manifest } from '../agent/manifest.ts';
 import { mounts, readEnv, split } from './config.ts';
 import { ensureImage, has, localCodexAuth, start } from './docker.ts';
-import { onboard } from './onboarding.tsx';
 import {
   agentDir,
   authFile,
@@ -20,7 +18,22 @@ import {
   tooWide,
 } from './paths.ts';
 import { encode, lineReader, type ToAgent, type ToHost } from './protocol.ts';
-import { Dashboard, pinSize, type Bridge } from './ui/app.tsx';
+import type { Bridge } from './ui/app.tsx';
+
+/**
+ * React picks its build from NODE_ENV when it is first required, and its
+ * development build reports every render to the Performance Track — a
+ * performance.measure() per component, each carrying a detail object naming
+ * the changed props. Node buffers user timing entries for the life of the
+ * process and nothing ever clears them, so a dashboard that redraws once a
+ * second accumulates them until the heap limit kills the host, and the
+ * container dies with it. Two agents died this way, ~35 hours in each time.
+ *
+ * This has to run before ink is loaded, which is why ink, the wizard and the
+ * dashboard are all imported where they are used rather than at the top of
+ * this file. Set NODE_ENV yourself to get the development build back.
+ */
+process.env.NODE_ENV ??= 'production';
 
 const name = manifest.name;
 
@@ -150,6 +163,13 @@ async function reset() {
 }
 
 async function up(reconfigure: boolean) {
+  // After NODE_ENV is settled above. These three are the whole of this CLI's
+  // React surface, and importing them any earlier undoes the line that matters.
+  const { render } = await import('ink');
+  const { createElement } = await import('react');
+  const { onboard } = await import('./onboarding.tsx');
+  const { Dashboard, pinSize } = await import('./ui/app.tsx');
+
   if (!has('docker')) {
     console.error(
       'Docker is not installed, and the agent only runs in Docker.\nGet it: https://docs.docker.com/get-docker/',
@@ -222,7 +242,12 @@ async function up(reconfigure: boolean) {
   let stderr = '';
   child.stderr?.on('data', (chunk) => (stderr = (stderr + chunk).slice(-4000)));
 
-  const app = render(<Dashboard bridge={bridge} name={settings.TEMPER_NAME ?? name} />, { exitOnCtrlC: false });
+  // createElement rather than JSX: the JSX transform compiles to a hoisted
+  // import of react/jsx-runtime, which would load React above the line that
+  // decides which React we get.
+  const app = render(createElement(Dashboard, { bridge, name: settings.TEMPER_NAME ?? name }), {
+    exitOnCtrlC: false,
+  });
 
   const reuseLogin = settings.TEMPER_CODEX_LOGIN === 'reuse' && !settings.OPENAI_API_KEY;
   bridge.send({
