@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -348,6 +348,27 @@ const ROOMS = [
   const real = pinSize({ columns: 143, rows: 47 });
   assert.deepEqual([real.columns, real.rows], [143, 47], 'a terminal that knows its own size is left alone');
   console.log('ok  the terminal always reports a size, so Ink never goes hunting for one');
+}
+
+// the CLI must decide which React it gets before React is loaded
+{
+  const cli = readFileSync(new URL('../dist/src/cli.js', import.meta.url), 'utf8');
+  assert.ok(/process\.env\.NODE_ENV \?\?=/.test(cli), 'the NODE_ENV guard is gone');
+
+  // Static imports are hoisted, so they run before the guard whatever order
+  // they are written in. React's development build reports every render to the
+  // Performance Track, Node buffers those entries for the life of the process,
+  // and a dashboard that redraws once a second then dies of the heap limit
+  // about 35 hours in — twice, in production. Anything that reaches React has
+  // to be imported where it is used, not at the top of the file.
+  const hoisted = [...cli.matchAll(/^import\s[^\n]*?from\s*['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+  for (const spec of hoisted) {
+    assert.ok(
+      !/^(ink|react)(\/|$)/.test(spec) && !/(ui\/app|onboarding)/.test(spec),
+      `${spec} is imported at the top of cli.js, so React loads before NODE_ENV is set`,
+    );
+  }
+  console.log('ok  React is not loaded before the CLI decides which build it wants');
 }
 
 console.log('\nall passed');
